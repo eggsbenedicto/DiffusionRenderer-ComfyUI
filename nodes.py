@@ -1,3 +1,10 @@
+import os
+import sys
+
+# Add the directory of this file to the sys.path
+# This is necessary so that the cosmos_predict1 module can be found
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 import numpy as np
 from PIL import Image

@@ -15,6 +15,10 @@
 
 import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import cv2
 import imageio.v3 as imageio
 import numpy as np

@@ -14,7 +14,10 @@
 # limitations under the License.
 
 import json
+import sys
 import os
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cv2
 import imageio
@@ -27,6 +30,8 @@ from . import rendering_utils as util
 
 # Enable OpenEXR support in OpenCV
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
+
 
 
 def hdr_mapping(env_hdr, log_scale):
