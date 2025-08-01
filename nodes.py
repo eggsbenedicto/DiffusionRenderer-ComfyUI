@@ -49,7 +49,7 @@ VAE_CONFIG_PATH = os.path.join(script_directory, "VAE_config.json")  # Placehold
 
 # Import our clean VAE implementation
 from .CleanVAE import CleanVAE
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKLCosmos
 
 # Use our clean pipeline instead of the original kludgy one
 from diffusion_renderer_pipeline import CleanDiffusionRendererPipeline
@@ -205,7 +205,7 @@ class LoadDiffusionRendererModel:
                 raise ValueError(f"Only .safetensors VAE files are supported, got: {vae_path}")
                 
             print(f"Loading VAE architecture from: {VAE_CONFIG_PATH}")
-            vae_model_diffusers = AutoencoderKL.from_config(VAE_CONFIG_PATH)
+            vae_model_diffusers = AutoencoderKLCosmos.from_config(VAE_CONFIG_PATH)
             
             print(f"Loading VAE weights from: {vae_path}")
             from safetensors.torch import load_file
@@ -252,8 +252,8 @@ class LoadDiffusionRendererModel:
             vae_instance=vae_instance,  # Pass loaded VAE instance
             model_instance=model_instance,  # Pass pre-loaded diffusion model instance
             # These are default values - actual dimensions will be inferred from input tensors
-            guidance=2.0,
-            num_steps=20,
+            guidance=0.0,
+            num_steps=15,
             height=1024,  # Default, will be overridden by input
             width=1024,   # Default, will be overridden by input
             num_video_frames=1,  # Default, will be overridden by input
@@ -352,14 +352,14 @@ class Cosmos1ForwardRenderer:
                 "env_map": ("IMAGE",),
             },
             "optional": {
-                "guidance": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "guidance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
                 # Enhanced environment map controls (only available with new system)
                 "env_format": (["proj", "ball", "fixed"], {"default": "proj", "tooltip": "proj: equirectangular, ball: chrome ball, fixed: fixed format"}),
-                "env_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1, "tooltip": "Environment map brightness multiplier"}),
+                "env_brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1, "tooltip": "Environment map brightness multiplier"}),
                 "env_flip_horizontal": ("BOOLEAN", {"default": False, "tooltip": "Flip environment map horizontally"}),
                 "env_flip_vertical": ("BOOLEAN", {"default": False, "tooltip": "Flip environment map vertically"}),
-                "env_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0, "tooltip": "Rotate environment map (degrees)"}),
+                "env_rotation": ("FLOAT", {"default": 180.0, "min": 0, "max": 360, "step": 1.0, "tooltip": "Rotate environment map (degrees)"}),
             }
         }
 
@@ -368,7 +368,7 @@ class Cosmos1ForwardRenderer:
     CATEGORY = "Cosmos1"
 
     def run_forward_pass(self, pipeline, depth, normal, roughness, metallic, base_color, env_map, 
-                        guidance=2.0, seed=42, env_format="proj", env_strength=1.0, 
+                        guidance=2.0, seed=42, env_format="proj", env_brightness=1.0, 
                         env_flip_horizontal=False, env_flip_vertical=False, env_rotation=0.0):
         # Set model type based on node being used (forward renderer)
         pipeline.set_model_type("forward")
@@ -445,7 +445,7 @@ class Cosmos1ForwardRenderer:
                         resolution=(H, W),
                         num_frames=T,
                         env_format=env_format,
-                        env_strength=env_strength,
+                        env_brightness=env_brightness,
                         env_flip_horizontal=env_flip_horizontal,
                         env_flip_vertical=env_flip_vertical,
                         env_rotation=env_rotation,
@@ -534,138 +534,51 @@ class Cosmos1ForwardRenderer:
             pass
             
         return envlight_dict
-
-
-class PreprocessEnvironmentMap:
-    """Standalone environment map preprocessing node"""
     
-    @classmethod
-    def INPUT_TYPES(s):
-        if not ENVMAP_SYSTEM_AVAILABLE:
-            return {
-                "required": {
-                    "env_map": ("IMAGE",),
-                },
-                "optional": {
-                    "info": ("STRING", {"default": "Advanced environment map processing not available. Install preprocess_envmap.py", "multiline": True}),
-                }
-            }
-        
-        return {
-            "required": {
-                "env_map": ("IMAGE",),
-                "env_format": (["proj", "ball", "fixed"], {"default": "proj"}),
-                "target_resolution": ("INT", {"default": 1024, "min": 256, "max": 4096, "step": 64}),
-            },
-            "optional": {
-                "env_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "env_flip_horizontal": ("BOOLEAN", {"default": False}),
-                "env_flip_vertical": ("BOOLEAN", {"default": False}),
-                "env_rotation": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 5.0}),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("processed_env_map", "info")
-    FUNCTION = "preprocess_envmap"
-    CATEGORY = "Cosmos1/Utils"
-
-    def preprocess_envmap(self, env_map, env_format="proj", target_resolution=1024, 
-                         env_strength=1.0, env_flip_horizontal=False, env_flip_vertical=False, env_rotation=0.0, **kwargs):
-        if not ENVMAP_SYSTEM_AVAILABLE:
-            return (env_map, "Advanced environment map processing not available")
-        
-        try:
-            device = mm.get_torch_device()
-            
-            # Convert ComfyUI IMAGE tensor to numpy
-            if isinstance(env_map, list):
-                env_map = torch.stack(env_map)
-            if env_map.ndim == 4:
-                env_map = env_map[0]  # Take first image from batch
-            if env_map.ndim == 3:
-                env_map_np = env_map.cpu().numpy()
-            else:
-                env_map_np = env_map[0].cpu().numpy()  # Take first frame if video
-            
-            # Process with the robust system
-            result = process_environment_map_robust(
-                env_input=env_map_np,
-                resolution=(target_resolution, target_resolution),
-                num_frames=1,
-                env_format=env_format,
-                env_strength=env_strength,
-                env_flip_horizontal=env_flip_horizontal,
-                env_flip_vertical=env_flip_vertical,
-                env_rotation=env_rotation,
-                device=device,
-            )
-            
-            # Convert back to ComfyUI IMAGE format
-            processed_ldr = result['env_ldr'][0]  # Take first frame
-            processed_tensor = torch.from_numpy(processed_ldr).float().unsqueeze(0)  # Add batch dimension
-            
-            info = f"Processed with format: {env_format}, resolution: {target_resolution}x{target_resolution}, strength: {env_strength}"
-            
-            return (processed_tensor, info)
-            
-        except Exception as e:
-            error_msg = f"Environment map preprocessing failed: {str(e)}"
-            logging.error(error_msg)
-            return (env_map, error_msg)
-
-
-class EnvironmentMapCacheManager:
-    """Utility node for managing environment map cache"""
-    
+class LoadHDRImage:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "action": (["get_stats", "clear_cache"], {"default": "get_stats"}),
+                "path": ("STRING", {"tooltip": "Path to HDR image (.hdr, .exr)"})
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("cache_info",)
-    FUNCTION = "manage_cache"
-    CATEGORY = "Cosmos1/Utils"
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "load_hdr"
+    CATEGORY = "Cosmos1"
 
-    def manage_cache(self, action="get_stats"):
-        if not ENVMAP_SYSTEM_AVAILABLE:
-            return ("Environment map cache system not available",)
-        
-        try:
-            if action == "get_stats":
-                stats = get_cache_stats()
-                info = f"Cache Stats:\n"
-                info += f"- Entries: {stats.get('entries', 0)}\n"
-                info += f"- Hits: {stats.get('hits', 0)}\n"
-                info += f"- Misses: {stats.get('misses', 0)}\n"
-                info += f"- Memory Usage: {stats.get('memory_mb', 0):.1f} MB"
-                return (info,)
-            elif action == "clear_cache":
-                cleared_count = clear_environment_cache()
-                return (f"Cleared {cleared_count} cache entries",)
-                
-        except Exception as e:
-            error_msg = f"Cache management failed: {str(e)}"
-            logging.error(error_msg)
-            return (error_msg,)
+    def load_hdr(self, path):
+        import imageio
+        import torch
+        import numpy as np
+
+        # Load HDR image as float32 numpy array
+        img = imageio.imread(path, format='HDR-FI')  # For .hdr files
+        # If .exr, use format='EXR-FI' or OpenEXR for more control
+
+        # Ensure shape is (H, W, C)
+        if img.ndim == 2:
+            img = np.stack([img]*3, axis=-1)
+        elif img.ndim == 3 and img.shape[2] == 1:
+            img = np.repeat(img, 3, axis=2)
+
+        # Convert to torch tensor, shape (1, H, W, C), dtype float32
+        tensor = torch.from_numpy(img).float().unsqueeze(0)
+
+        return (tensor,)
 
 
 NODE_CLASS_MAPPINGS = {
     "LoadDiffusionRendererModel": LoadDiffusionRendererModel,
     "Cosmos1InverseRenderer": Cosmos1InverseRenderer,
     "Cosmos1ForwardRenderer": Cosmos1ForwardRenderer,
-    "PreprocessEnvironmentMap": PreprocessEnvironmentMap,
-    "EnvironmentMapCacheManager": EnvironmentMapCacheManager,
+    "LoadHDRImage": LoadHDRImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadDiffusionRendererModel": "Load Diffusion Renderer Model",
     "Cosmos1InverseRenderer": "Cosmos1 Inverse Renderer",
     "Cosmos1ForwardRenderer": "Cosmos1 Forward Renderer",
-    "PreprocessEnvironmentMap": "Preprocess Environment Map",
-    "EnvironmentMapCacheManager": "Environment Map Cache Manager",
+    "LoadHDRImage": "Load HDR Image",
 }

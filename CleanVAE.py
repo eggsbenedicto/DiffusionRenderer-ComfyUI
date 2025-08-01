@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Clean implementation of Video VAE/Tokenizer using diffusers AutoencoderKL.
+Clean implementation of Video VAE/Tokenizer using diffusers AutoencoderKLCosmos.
 Based on the official cosmos_predict1.diffusion.module.pretrained_vae implementation.
 """
 
@@ -26,7 +26,7 @@ from einops import rearrange
 import os
 import math
 
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKLCosmos
 
 
 # Hardcoded path to the trusted VAE configuration file.
@@ -37,16 +37,16 @@ VAE_CONFIG_PATH = os.path.join(script_directory, "VAE_config.json")
 
 class CleanVAE:
     """
-    Clean implementation of Video VAE using diffusers AutoencoderKL.
+    Clean implementation of Video VAE using diffusers AutoencoderKLCosmos.
     Handles spatial and temporal compression for video diffusion models.
     """
     
-    def __init__(self, vae_model: 'AutoencoderKL', temporal_compression_ratio: int = 8):
+    def __init__(self, vae_model: 'AutoencoderKLCosmos', temporal_compression_ratio: int = 8):
         """
         Initialize the VAE with a loaded diffusers model.
         
         Args:
-            vae_model: An already-loaded AutoencoderKL model from diffusers
+            vae_model: An already-loaded AutoencoderKLCosmos model from diffusers
             temporal_compression_ratio: Temporal compression factor (default 8)
         """
         if vae_model is None:
@@ -233,15 +233,6 @@ class CleanVAE:
         latent = latent.to(device=self.device, dtype=self.dtype)
         
         # Apply temporal decompression if needed
-        if pixel_T != latent_T:
-            # Simple temporal upsampling for now
-            # In a full implementation, this would use learned temporal decompression
-            latent = F.interpolate(
-                latent.permute(0, 1, 3, 4, 2),  # (B, C, H, W, T)
-                size=pixel_T,
-                mode='linear',
-                align_corners=False
-            ).permute(0, 1, 4, 2, 3)  # Back to (B, C, T, H, W)
         
         # Process each frame through the VAE decoder
         # Note: diffusers VAE expects 4D input (B, C, H, W)
@@ -264,15 +255,6 @@ class CleanVAE:
             decoded_state = torch.stack(decoded_frames, dim=2)  # (B, C, T, H, W)
         
         return decoded_state.to(original_dtype)
-            
-    @property
-    def spatial_compression_factor(self) -> int:
-        """Get spatial compression factor"""
-        return self.spatial_compression_ratio
-        
-    @property
-    def temporal_compression_factor(self) -> int:
-        """Get temporal compression factor"""
         return self.temporal_compression_ratio
         
     @property

@@ -28,23 +28,23 @@ class EnvironmentMapCache:
         self.max_size = max_size
     
     def _generate_key(self, env_hash: str, resolution: Tuple[int, int], 
-                     format_type: str, env_strength: float, env_flip: bool, env_rot: float) -> str:
+                     format_type: str, env_brightness: float, env_flip: bool, env_rot: float) -> str:
         """Generate cache key from parameters"""
-        return f"{env_hash}_{resolution}_{format_type}_{env_strength}_{env_flip}_{env_rot}"
+        return f"{env_hash}_{resolution}_{format_type}_{env_brightness}_{env_flip}_{env_rot}"
     
     def get(self, env_hash: str, resolution: Tuple[int, int], format_type: str, 
-            env_strength: float, env_flip: bool, env_rot: float) -> Optional[Dict]:
+            env_brightness: float, env_flip: bool, env_rot: float) -> Optional[Dict]:
         """Retrieve cached result if available"""
-        key = self._generate_key(env_hash, resolution, format_type, env_strength, env_flip, env_rot)
+        key = self._generate_key(env_hash, resolution, format_type, env_brightness, env_flip, env_rot)
         if key in self.cache:
             self.access_times[key] = time.time()
             return self.cache[key]
         return None
     
     def put(self, env_hash: str, resolution: Tuple[int, int], format_type: str,
-            env_strength: float, env_flip: bool, env_rot: float, result: Dict):
+            env_brightness: float, env_flip: bool, env_rot: float, result: Dict):
         """Cache processing result with LRU eviction"""
-        key = self._generate_key(env_hash, resolution, format_type, env_strength, env_flip, env_rot)
+        key = self._generate_key(env_hash, resolution, format_type, env_brightness, env_flip, env_rot)
         
         # Evict oldest if cache is full
         if len(self.cache) >= self.max_size and key not in self.cache:
@@ -259,14 +259,14 @@ def process_comfyui_tensor(tensor: torch.Tensor) -> torch.Tensor:
     
     return tensor
 
-def apply_hdr_preprocessing(latlong_img: torch.Tensor, env_strength: float, 
+def apply_hdr_preprocessing(latlong_img: torch.Tensor, env_brightness: float, 
                            env_flip: bool, env_rot: float, device: str) -> torch.Tensor:
     """Apply official HDR preprocessing transformations"""
     latlong_img = latlong_img.to(device)
     
     # Apply strength multiplier
-    if env_strength != 1.0:
-        latlong_img *= env_strength
+    if env_brightness != 1.0:
+        latlong_img *= env_brightness
     
     # Cleanup NaNs and Infs (official implementation)
     latlong_img = torch.nan_to_num(latlong_img, nan=0.0, posinf=65504.0, neginf=0.0)
@@ -285,14 +285,14 @@ def apply_hdr_preprocessing(latlong_img: torch.Tensor, env_strength: float,
     return latlong_img
 
 def load_and_preprocess_hdr_robust(env_input: Union[str, torch.Tensor], 
-                                  env_strength: float, env_flip: bool, 
+                                  env_brightness: float, env_flip: bool, 
                                   env_rot: float, device: str) -> torch.Tensor:
     """
     Robust HDR loading and preprocessing supporting multiple input types
     
     Args:
         env_input: File path or ComfyUI IMAGE tensor
-        env_strength: HDR intensity multiplier  
+        env_brightness: HDR intensity multiplier  
         env_flip: Horizontal flip for coordinate correction
         env_rot: Rotation in degrees
         device: Target device
@@ -309,7 +309,7 @@ def load_and_preprocess_hdr_robust(env_input: Union[str, torch.Tensor],
         raise ValueError(f"Unsupported input type: {type(env_input)}")
     
     # Apply preprocessing
-    latlong_img = apply_hdr_preprocessing(latlong_img, env_strength, env_flip, env_rot, device)
+    latlong_img = apply_hdr_preprocessing(latlong_img, env_brightness, env_flip, env_rot, device)
     
     # Convert to official 512x512 cubemap
     cubemap = latlong_to_cubemap_official(latlong_img, [512, 512])
@@ -460,7 +460,7 @@ def create_neutral_environment(resolution: Tuple[int, int],
 
 def process_environment_map_simplified(env_input: Union[str, torch.Tensor],
                                      format_type: str, resolution: Tuple[int, int],
-                                     env_strength: float = 1.0, env_flip: bool = True,
+                                     env_brightness: float = 1.0, env_flip: bool = True,
                                      env_rot: float = 180.0, device: str = 'cuda',
                                      **kwargs) -> Dict[str, torch.Tensor]:
     """Simplified fallback processing"""
@@ -483,7 +483,7 @@ def process_environment_map_simplified(env_input: Union[str, torch.Tensor],
         ).squeeze(0).permute(1, 2, 0)
     
     # Apply strength
-    env_tensor *= env_strength
+    env_tensor *= env_brightness
     
     # Simple tone mapping
     env_ldr = env_tensor / (env_tensor.max() + 1e-8)
@@ -501,7 +501,7 @@ def process_environment_map_simplified(env_input: Union[str, torch.Tensor],
 
 def process_environment_map_official(env_input: Union[str, torch.Tensor],
                                    format_type: str, resolution: Tuple[int, int],
-                                   env_strength: float = 1.0, env_flip: bool = True,
+                                   env_brightness: float = 1.0, env_flip: bool = True,
                                    env_rot: float = 180.0, device: str = 'cuda',
                                    num_frames: int = 1, **kwargs) -> Dict[str, torch.Tensor]:
     """
@@ -511,7 +511,7 @@ def process_environment_map_official(env_input: Union[str, torch.Tensor],
         env_input: File path or tensor input
         format_type: 'proj', 'ball', or 'fixed'
         resolution: Target resolution (H, W)
-        env_strength: HDR intensity multiplier
+        env_brightness: HDR intensity multiplier
         env_flip: Horizontal flip for correct orientation
         env_rot: Rotation in degrees
         device: Processing device
@@ -523,7 +523,7 @@ def process_environment_map_official(env_input: Union[str, torch.Tensor],
     H, W = resolution
     
     # Load and preprocess to cubemap
-    cubemap = load_and_preprocess_hdr_robust(env_input, env_strength, env_flip, env_rot, device)
+    cubemap = load_and_preprocess_hdr_robust(env_input, env_brightness, env_flip, env_rot, device)
     
     # Generate direction vectors
     vec = latlong_vec((H, W), device=device)
@@ -569,7 +569,7 @@ def process_environment_map_official(env_input: Union[str, torch.Tensor],
 def process_environment_map_robust(env_input: Union[str, torch.Tensor],
                                  format_type: str = 'proj', 
                                  resolution: Tuple[int, int] = (512, 512),
-                                 env_strength: float = 1.0, env_flip: bool = True,
+                                 env_brightness: float = 1.0, env_flip: bool = True,
                                  env_rot: float = 180.0, device: str = 'cuda',
                                  use_cache: bool = True, **kwargs) -> Dict[str, torch.Tensor]:
     """
@@ -585,7 +585,7 @@ def process_environment_map_robust(env_input: Union[str, torch.Tensor],
             env_hash = hashlib.md5(str(env_input).encode()).hexdigest()
         
         cached_result = _env_cache.get(env_hash, resolution, format_type, 
-                                      env_strength, env_flip, env_rot)
+                                      env_brightness, env_flip, env_rot)
         if cached_result is not None:
             logger.debug("Using cached environment map")
             return cached_result
@@ -593,13 +593,13 @@ def process_environment_map_robust(env_input: Union[str, torch.Tensor],
     # Try official implementation first
     try:
         result = process_environment_map_official(
-            env_input, format_type, resolution, env_strength, 
+            env_input, format_type, resolution, env_brightness, 
             env_flip, env_rot, device, **kwargs
         )
         
         if use_cache:
             _env_cache.put(env_hash, resolution, format_type, 
-                          env_strength, env_flip, env_rot, result)
+                          env_brightness, env_flip, env_rot, result)
         
         return result
         
@@ -609,7 +609,7 @@ def process_environment_map_robust(env_input: Union[str, torch.Tensor],
         try:
             # Fallback to simplified implementation
             result = process_environment_map_simplified(
-                env_input, format_type, resolution, env_strength,
+                env_input, format_type, resolution, env_brightness,
                 env_flip, env_rot, device, **kwargs
             )
             return result
