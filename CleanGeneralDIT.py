@@ -76,11 +76,11 @@ class CleanTimesteps(nn.Module):
 class CleanTimestepEmbedding(nn.Module):
     """Clean implementation of timestep embedding MLP"""
     
-    def __init__(self, in_channels: int, time_embed_dim: int, act_fn: str = "silu", use_adaln_lora: bool = False):
+    def __init__(self, in_channels: int, out_channels: int, time_embed_dim: int, act_fn: str = "silu",):
         super().__init__()
-        self.linear_1 = nn.Linear(in_channels, time_embed_dim)
+        self.linear_1 = nn.Linear(in_channels, out_channels)
         self.act = nn.SiLU() if act_fn == "silu" else nn.GELU()
-        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim)
+        self.linear_2 = nn.Linear(out_channels, out_channels * 3)
         
     def forward(self, sample):
         sample = self.linear_1(sample)
