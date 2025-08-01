@@ -234,7 +234,7 @@ class LoadDiffusionRendererModel:
         
         # Load the checkpoint weights into the model
         print(f"Loading diffusion model checkpoint: {checkpoint_path}")
-        model_instance.load_checkpoint(checkpoint_path, strict=False)
+        model_instance.load_checkpoint(checkpoint_path, strict=True)
         
         # Move to appropriate device and precision
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
