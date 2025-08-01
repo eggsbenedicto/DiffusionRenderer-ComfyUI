@@ -98,8 +98,8 @@ def get_network_config() -> Dict[str, Any]:
         "extra_w_extrapolation_ratio": 1.0,
         "extra_t_extrapolation_ratio": 1.0,
         
-        # Cross attention
-        "crossattn_emb_channels": 4096,  # Same as model_channels
+        # Cross attention - CRITICAL: Must match checkpoint context embedding dimension
+        "crossattn_emb_channels": 1024,  # Official checkpoint expects 1024, not 4096!
     }
 
 

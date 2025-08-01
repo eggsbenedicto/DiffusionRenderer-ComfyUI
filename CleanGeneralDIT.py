@@ -21,7 +21,7 @@ Based on the original cosmos_predict1.diffusion.networks.general_dit but simplif
 import torch
 import torch.nn as nn
 from typing import Dict, Tuple, Optional, Union
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 import math
 
@@ -79,10 +79,11 @@ class CleanTimestepEmbedding(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, use_adaln_lora: bool = False, act_fn: str = "silu"):
         super().__init__()
-        self.linear_1 = nn.Linear(in_channels, out_channels)
+        # Add bias=True to match checkpoint expectations
+        self.linear_1 = nn.Linear(in_channels, out_channels, bias=True)
         self.act = nn.SiLU() if act_fn == "silu" else nn.GELU()
         # Official implementation outputs out_channels * 3 in the second linear
-        self.linear_2 = nn.Linear(out_channels, out_channels * 3)
+        self.linear_2 = nn.Linear(out_channels, out_channels * 3, bias=True)
         self.use_adaln_lora = use_adaln_lora
         
     def forward(self, sample):
@@ -183,12 +184,13 @@ class OfficialVideoAttn(nn.Module):
         self.head_dim = x_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Match official VideoAttn structure using simplified attention
-        self.to_q = nn.Linear(x_dim, x_dim, bias=bias)
-        self.to_k = nn.Linear(context_dim if context_dim else x_dim, x_dim, bias=bias)
-        self.to_v = nn.Linear(context_dim if context_dim else x_dim, x_dim, bias=bias)
-        self.to_out = nn.Linear(x_dim, x_dim, bias=bias)
-        
+        # Match checkpoint naming: attn.to_q.0.weight etc.
+        self.attn = nn.ModuleDict({
+            'to_q': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
+            'to_k': nn.Sequential(nn.Linear(context_dim if context_dim else x_dim, x_dim, bias=bias)),
+            'to_v': nn.Sequential(nn.Linear(context_dim if context_dim else x_dim, x_dim, bias=bias)),
+            'to_out': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
+        })
     def forward(self, x, context=None, crossattn_mask=None, rope_emb_L_1_1_D=None):
         """
         x: (T, H, W, B, D) - official format
@@ -206,10 +208,10 @@ class OfficialVideoAttn(nn.Module):
         else:
             k_input = v_input = x_seq
             
-        # Compute attention
-        q = self.to_q(x_seq).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.to_k(k_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.to_v(v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # Compute attention using checkpoint naming structure
+        q = self.attn['to_q'][0](x_seq).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.attn['to_k'][0](k_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.attn['to_v'][0](v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         
         # Apply RoPE if provided
         if rope_emb_L_1_1_D is not None and context is None:  # Only for self-attention
@@ -227,7 +229,7 @@ class OfficialVideoAttn(nn.Module):
         out = attn @ v
         
         out = out.transpose(1, 2).reshape(B, -1, D)
-        out = self.to_out(out)
+        out = self.attn['to_out'][0](out)
         
         # Convert back to official format
         out = rearrange(out, "b (t h w) d -> t h w b d", t=T, h=H, w=W)
@@ -464,7 +466,6 @@ class OfficialFinalLayer(nn.Module):
         B = emb_B_D.shape[0]
         T = x_BT_HW_D.shape[0] // B
         
-        from einops import repeat
         shift_BT_D, scale_BT_D = repeat(shift_B_D, "b d -> (b t) d", t=T), repeat(scale_B_D, "b d -> (b t) d", t=T)
         
         def modulate(x, shift, scale):
@@ -542,9 +543,9 @@ class CleanGeneralDIT(nn.Module):
         self._build_blocks()
         self._build_final_layer()
         
-        # Normalization
+        # Normalization - add bias=True to match checkpoint
         if affline_emb_norm:
-            self.affline_norm = nn.LayerNorm(model_channels)
+            self.affline_norm = nn.LayerNorm(model_channels, bias=True)
         else:
             self.affline_norm = nn.Identity()
             
@@ -572,23 +573,26 @@ class CleanGeneralDIT(nn.Module):
         )
         
     def _build_pos_embed(self):
-        """Build position embedding with learnable embeddings to match official"""
+        """Build position embedding to match checkpoint naming exactly"""
         if hasattr(self, 'pos_emb_cls') and self.pos_emb_cls == "rope3d":
             head_dim = self.model_channels // self.num_heads
-            self.pos_embedder = CleanRoPE3D(
+            self.rope_handler = CleanRoPE3D(
                 head_dim=head_dim,
                 max_t=self.max_frames // self.patch_temporal,
                 max_h=self.max_img_h // self.patch_spatial,
                 max_w=self.max_img_w // self.patch_spatial
             )
         else:
-            self.pos_embedder = None
+            self.rope_handler = None
             
-        # Add learnable positional embeddings to match official pos_embedder.seq
+        # Create pos_embedder with seq parameter to match checkpoint: net.pos_embedder.seq
         max_seq_len = (self.max_frames // self.patch_temporal) * \
                      (self.max_img_h // self.patch_spatial) * \
                      (self.max_img_w // self.patch_spatial)
-        self.pos_embedder_seq = nn.Parameter(torch.randn(max_seq_len, self.model_channels) * 0.02)
+        
+        # Use nn.Module with registered parameter to match checkpoint structure
+        self.pos_embedder = nn.Module()
+        self.pos_embedder.seq = nn.Parameter(torch.randn(max_seq_len, self.model_channels) * 0.02)
             
     def _build_blocks(self):
         """Build transformer blocks using official structure"""
@@ -670,8 +674,8 @@ class CleanGeneralDIT(nn.Module):
         
         # Position embedding for RoPE
         rope_emb = None
-        if self.pos_embedder is not None:
-            rope_emb_3d = self.pos_embedder.get_rope_embeddings(T_p, H_p, W_p, x.device)
+        if self.rope_handler is not None:
+            rope_emb_3d = self.rope_handler.get_rope_embeddings(T_p, H_p, W_p, x.device)
             rope_emb = rearrange(rope_emb_3d, "t h w d -> (t h w) 1 1 d")  # (L, 1, 1, D)
             
         return x, timestep_emb, crossattn_emb, rope_emb, (B, C, T, H, W), (T_p, H_p, W_p)
@@ -746,6 +750,55 @@ class CleanGeneralDIT(nn.Module):
         print(f"[DIT] Final output shape: {x.shape} (expected 5D: B,C,T,H,W)")
         
         return x
+
+    def load_checkpoint(self, checkpoint_path: str, strict: bool = False):
+        """
+        Load checkpoint with proper error handling and memory management
+        """
+        try:
+            print(f"[DIT] Loading checkpoint from: {checkpoint_path}")
+            
+            # Clear GPU cache before loading
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            # Load checkpoint
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # Extract state dict
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model' in checkpoint:
+                state_dict = checkpoint['model']
+            else:
+                state_dict = checkpoint
+                
+            print(f"[DIT] Checkpoint contains {len(state_dict)} parameters")
+            
+            # Try loading with flexible matching
+            missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=strict)
+            
+            if missing_keys:
+                print(f"[DIT] Missing keys ({len(missing_keys)}): {missing_keys[:5]}...")
+            if unexpected_keys:
+                print(f"[DIT] Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+                
+            if not strict and (missing_keys or unexpected_keys):
+                print(f"[DIT] ⚠️ Checkpoint loaded with parameter mismatches (strict=False)")
+                return True
+            elif missing_keys or unexpected_keys:
+                print(f"[DIT] ❌ Checkpoint loading failed due to parameter mismatches")
+                return False
+            else:
+                print(f"[DIT] ✅ Checkpoint loaded successfully")
+                return True
+                
+        except Exception as e:
+            print(f"[DIT] ❌ Error loading checkpoint: {e}")
+            # Clear GPU cache on error to prevent memory leaks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return False
 
 
 class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):

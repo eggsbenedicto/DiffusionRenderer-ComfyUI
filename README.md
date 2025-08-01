@@ -1,1 +1,1 @@
-Experimental wrapper for diffusion-renderer in ComfyUI. Currently unfinished and non-functioning. Will update
+Experimental wrapper for diffusion-renderer in ComfyUI. Still under testing and feature expansion
