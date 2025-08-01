@@ -51,10 +51,18 @@ def get_network_config() -> Dict[str, Any]:
         "model_channels": 4096,
         "num_blocks": 28,
         "num_heads": 32,
-        
+        'head_dim': 128,
+        'mlp_ratio': 4.0,
+        'context_dim': 1024,
+        'adaln_lora_dim': 256,
+
+        'time_embed_dim': 4096,  
+        'max_time_embed_period': 10000,
+
         # Input/Output channels
         "in_channels": 16,
         "out_channels": 16,
+        
         
         # Patch embedding
         "patch_spatial": 2,
@@ -78,7 +86,7 @@ def get_network_config() -> Dict[str, Any]:
         # RoPE extrapolation ratios
         "rope_h_extrapolation_ratio": 1.0,
         "rope_w_extrapolation_ratio": 1.0,
-        "rope_t_extrapolation_ratio": 1.0,
+        "rope_t_extrapolation_ratio": 2.0,
         
         # Additional features
         "affline_emb_norm": True,

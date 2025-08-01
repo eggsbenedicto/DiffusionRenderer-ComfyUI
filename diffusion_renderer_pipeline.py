@@ -221,12 +221,9 @@ class CleanDiffusionRendererPipeline:
         model = CleanDiffusionRendererModel(self.config)
         
         # Load checkpoint if it exists
-        if os.path.exists(checkpoint_path):
-            print(f"Loading checkpoint from: {checkpoint_path}")
-            model.load_checkpoint(checkpoint_path, strict=False)
-        else:
-            print(f"Warning: Checkpoint not found at {checkpoint_path}")
-            print("Continuing with randomly initialized model")
+        
+        print(f"Loading checkpoint from: {checkpoint_path}")
+        model.load_checkpoint(checkpoint_path, strict=False)
         
         # Move to device
         model = model.to(self.device)

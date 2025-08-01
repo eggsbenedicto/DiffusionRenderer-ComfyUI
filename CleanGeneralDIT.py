@@ -324,7 +324,7 @@ class CleanFinalLayer(nn.Module):
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 256, bias=True)
         )
         self.spatial_patch_size = spatial_patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -363,6 +363,7 @@ class CleanGeneralDIT(nn.Module):
         num_heads: int = 32,
         mlp_ratio: float = 4.0,
         block_config: str = "FA-CA-MLP",
+
         
         # Cross attention
         crossattn_emb_channels: int = 4096,
@@ -370,10 +371,6 @@ class CleanGeneralDIT(nn.Module):
         
         # Position embedding
         pos_emb_cls: str = "rope3d",
-        
-        # AdaLN LoRA
-        use_adaln_lora: bool = True,
-        adaln_lora_dim: int = 256,
         
         # Additional features
         affline_emb_norm: bool = True,
