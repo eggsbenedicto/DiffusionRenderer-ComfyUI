@@ -30,8 +30,8 @@ except ImportError:
     SAFETENSORS_AVAILABLE = False
 
 # Import our clean model implementation
-from model_diffusion_renderer import CleanDiffusionRendererModel
-from diffusion_renderer_config import get_config_by_model_type, get_config_from_tensor_shape, validate_config
+from .model_diffusion_renderer import CleanDiffusionRendererModel
+from .diffusion_renderer_config import get_config_by_model_type, get_config_from_tensor_shape, validate_config
 
 
 class CleanDiffusionRendererPipeline:
@@ -266,6 +266,8 @@ class CleanDiffusionRendererPipeline:
         if video_tensor is None:
             raise ValueError("No input tensor found in data_batch")
         
+        print(f"[Pipeline] Found input tensor shape: {video_tensor.shape} (expected 5D: B,C,T,H,W)")
+        
         # 3. Ensure model is loaded with correct config for this input shape
         model = self._ensure_model_loaded(video_tensor.shape)
         
@@ -280,9 +282,9 @@ class CleanDiffusionRendererPipeline:
         W = input_W // 8  # Spatial compression
         state_shape = [C, F, H, W]
         
-        print(f"Input shape: {video_tensor.shape}")
-        print(f"State shape: {state_shape}")
-        print(f"Expected latent shape from config: {config_latent_shape}")
+        print(f"[Pipeline] Input shape: {video_tensor.shape}")
+        print(f"[Pipeline] State shape: {state_shape}")
+        print(f"[Pipeline] Expected latent shape from config: {config_latent_shape}")
         
         # 4. Core diffusion sampling - use runtime guidance and num_steps
         sample = self.model.generate_samples_from_batch(
@@ -293,9 +295,11 @@ class CleanDiffusionRendererPipeline:
             is_negative_prompt=False,
             seed=effective_seed,
         )
+        print(f"[Pipeline] Diffusion sample output shape: {sample.shape}")
         
         # 5. VAE decode
         video = self.model.decode(sample)
+        print(f"[Pipeline] After VAE decode shape: {video.shape}")
         
         # 6. Post-processing (exact logic from original)
         if normalize_normal:
@@ -308,9 +312,12 @@ class CleanDiffusionRendererPipeline:
                 0, 1
             )
             video = video_normalized * blend_ratio + video * (1 - blend_ratio)
+            print(f"[Pipeline] After normal normalization shape: {video.shape}")
 
         # 7. Convert to numpy (exact logic from original)
         video = (1.0 + video).clamp(0, 2) / 2
+        print(f"[Pipeline] Before permute/convert, video shape: {video.shape}")
         video = (video[0].permute(1, 2, 3, 0) * 255).to(torch.uint8).cpu().numpy()
+        print(f"[Pipeline] Final numpy output shape: {video.shape}")
         
         return video

@@ -377,6 +377,7 @@ class CleanGeneralDIT(nn.Module):
         
         # Additional features
         affline_emb_norm: bool = True,
+        **kwargs
     ):
         super().__init__()
         
@@ -516,12 +517,14 @@ class CleanGeneralDIT(nn.Module):
         
     def forward(
         self,
-        x: torch.Tensor,
-        timesteps: torch.Tensor,
-        crossattn_emb: torch.Tensor,
-        crossattn_mask: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        latent_condition: Optional[torch.Tensor] = None,
+        x,
+        timesteps,
+        crossattn_emb,
+        crossattn_mask=None,
+        padding_mask=None,
+        latent_condition=None,
+        scalar_feature=None,
+
         **kwargs
     ) -> torch.Tensor:
         """
@@ -538,10 +541,17 @@ class CleanGeneralDIT(nn.Module):
         Returns:
             Output tensor (B, C_out, T, H, W)
         """
+        print(f"[DIT] Input x shape: {x.shape} (expected 5D: B,C,T,H,W)")
+        print(f"[DIT] timesteps shape: {timesteps.shape}")
+        if crossattn_emb is not None:
+            print(f"[DIT] crossattn_emb shape: {crossattn_emb.shape}")
+        
         # Prepare inputs
         x, timestep_emb, crossattn_emb, rope_emb, orig_shape, patch_shape = self.prepare_inputs(
             x, timesteps, crossattn_emb, padding_mask, latent_condition
         )
+        print(f"[DIT] After prepare_inputs, x shape: {x.shape}")
+        print(f"[DIT] orig_shape: {orig_shape}, patch_shape: {patch_shape}")
         
         # Process cross attention mask
         if self.use_cross_attn_mask and crossattn_mask is not None:
@@ -550,11 +560,14 @@ class CleanGeneralDIT(nn.Module):
             crossattn_mask = None
             
         # Apply transformer blocks
-        for block in self.blocks.values():
+        for i, block in enumerate(self.blocks.values()):
             x = block(x, timestep_emb, crossattn_emb, rope_emb, crossattn_mask)
+            if i == 0:  # Log first block output
+                print(f"[DIT] After block {i}, x shape: {x.shape}")
             
         # Final layer
         x = self.final_layer(x, timestep_emb)
+        print(f"[DIT] After final_layer, x shape: {x.shape}")
         
         # Reshape back to video format
         B, C_orig, T_orig, H_orig, W_orig = orig_shape
@@ -566,6 +579,7 @@ class CleanGeneralDIT(nn.Module):
             T=T_p, H=H_p, W=W_p,
             p1=self.patch_spatial, p2=self.patch_spatial, t=self.patch_temporal
         )
+        print(f"[DIT] Final output shape: {x.shape} (expected 5D: B,C,T,H,W)")
         
         return x
 

@@ -283,18 +283,31 @@ def get_config_from_tensor_shape(
     Returns:
         Configuration dictionary with dimensions inferred from tensor
     """
+    print(f"[Config] Generating config from tensor_shape: {tensor_shape}")
+    
     if len(tensor_shape) == 4:
         # Single image from ComfyUI: (B, H, W, C) -> assume T=1
         B, H, W, C = tensor_shape
         T = 1
+        print(f"[Config] 4D tensor detected: B={B}, H={H}, W={W}, C={C}, T={T} (assumed)")
     elif len(tensor_shape) == 5:
         # Video sequence from ComfyUI: (B, T, H, W, C)
         B, T, H, W, C = tensor_shape
+        print(f"[Config] 5D tensor detected: B={B}, T={T}, H={H}, W={W}, C={C}")
     else:
         raise ValueError(f"Unsupported tensor shape: {tensor_shape}. Expected 4D (B,H,W,C) or 5D (B,T,H,W,C) tensor from ComfyUI.")
     
+    # Calculate latent dimensions for validation
+    latent_T = (T - 1) // 8 + 1 if T > 1 else 1
+    latent_H = H // 8
+    latent_W = W // 8
+    print(f"[Config] Calculated latent dimensions: T={latent_T}, H={latent_H}, W={latent_W}")
+    
     # Use the appropriate config function with inferred dimensions
-    return get_config_by_model_type(model_type, H, W, T)
+    config = get_config_by_model_type(model_type, H, W, T)
+    print(f"[Config] Generated config for {model_type} model with latent_shape: {config['latent_shape']}")
+    
+    return config
 
 
 def validate_config(config: Dict[str, Any]) -> None:
@@ -307,6 +320,8 @@ def validate_config(config: Dict[str, Any]) -> None:
     Raises:
         ValueError: If configuration is invalid
     """
+    print(f"[Config] Validating configuration...")
+    
     required_keys = [
         "sigma_data", "precision", "input_data_key", "latent_shape",
         "condition_keys", "net", "scheduler", "vae"
@@ -321,6 +336,9 @@ def validate_config(config: Dict[str, Any]) -> None:
     if not isinstance(latent_shape, list) or len(latent_shape) != 4:
         raise ValueError(f"Invalid latent_shape: {latent_shape}. Expected [C, T, H, W] format.")
     
+    C, T, H, W = latent_shape
+    print(f"[Config] Latent shape validation: C={C}, T={T}, H={H}, W={W}")
+    
     # Validate network config
     net_config = config["net"]
     required_net_keys = ["model_channels", "num_blocks", "num_heads", "in_channels", "out_channels"]
@@ -328,10 +346,11 @@ def validate_config(config: Dict[str, Any]) -> None:
         if key not in net_config:
             raise ValueError(f"Missing required net config key: {key}")
     
-    print(f"✅ Configuration validated successfully")
-    print(f"   Model type: {config.get('model_type', 'unknown')}")
-    print(f"   Latent shape: {latent_shape}")
-    print(f"   Condition keys: {config['condition_keys']}")
+    print(f"[Config] ✅ Configuration validated successfully")
+    print(f"[Config]   Model type: {config.get('model_type', 'unknown')}")
+    print(f"[Config]   Latent shape: {latent_shape}")
+    print(f"[Config]   Condition keys: {config['condition_keys']}")
+    print(f"[Config]   Network: {net_config['model_channels']}ch, {net_config['num_blocks']}blocks, {net_config['num_heads']}heads")
 
 
 # Configuration presets for common use cases

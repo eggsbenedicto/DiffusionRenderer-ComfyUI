@@ -52,8 +52,9 @@ from .CleanVAE import CleanVAE
 from diffusers import AutoencoderKLCosmos
 
 # Use our clean pipeline instead of the original kludgy one
-from diffusion_renderer_pipeline import CleanDiffusionRendererPipeline
-from model_diffusion_renderer import CleanDiffusionRendererModel
+from .diffusion_renderer_pipeline import CleanDiffusionRendererPipeline
+from .model_diffusion_renderer import CleanDiffusionRendererModel
+from .diffusion_renderer_config import get_inverse_renderer_config
 
 # Import new environment map processing system
 try:
@@ -227,7 +228,6 @@ class LoadDiffusionRendererModel:
         
         # Create model instance with a basic config to establish the structure
         # The pipeline will later swap in the correct config for dynamic inference
-        from diffusion_renderer_config import get_inverse_renderer_config
         basic_config = get_inverse_renderer_config(height=1024, width=1024, num_frames=1)
         
         model_instance = CleanDiffusionRendererModel(basic_config)
@@ -268,10 +268,9 @@ class Cosmos1InverseRenderer:
             "required": {
                 "pipeline": ("DIFFUSION_RENDERER_PIPELINE",),
                 "image": ("IMAGE",),
-                "noise_level": ("INT", {"default": 100, "min": 0, "max": 1000}),
             },
             "optional": {
-                "guidance": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
+                "guidance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
             }
         }
@@ -281,7 +280,7 @@ class Cosmos1InverseRenderer:
     FUNCTION = "run_inverse_pass"
     CATEGORY = "Cosmos1"
 
-    def run_inverse_pass(self, pipeline, image, noise_level, guidance=2.0, seed=42):
+    def run_inverse_pass(self, pipeline, image, guidance=0.0, seed=42):
         # Set model type based on node being used (inverse renderer)
         pipeline.set_model_type("inverse")
         
@@ -290,12 +289,16 @@ class Cosmos1InverseRenderer:
         pipeline.seed = seed
 
         # Standardize image input to a 5D tensor (B, T, H, W, C)
+        print(f"[Nodes] Inverse renderer input image type: {type(image)}")
         if isinstance(image, list):
             image = torch.stack(image)
+            print(f"[Nodes] Stacked list to tensor: {image.shape}")
         if image.ndim == 4:
             image = image.unsqueeze(0)
+            print(f"[Nodes] Added batch dimension: {image.shape}")
 
         B, T, H, W, C = image.shape
+        print(f"[Nodes] Final input shape: {image.shape} (B={B}, T={T}, H={H}, W={W}, C={C})")
         pipeline.num_video_frames = T
         pipeline.height = H
         pipeline.width = W
@@ -307,14 +310,15 @@ class Cosmos1InverseRenderer:
 
         for i in range(B):
             image_slice = image[i] # Shape: (T, H, W, C)
+            print(f"[Nodes] Processing batch {i}, image_slice shape: {image_slice.shape}")
             
             # Pipeline expects image shape (1, T, C, H, W)
             image_tensor = image_slice.permute(0, 3, 1, 2).unsqueeze(0)
+            print(f"[Nodes] Prepared image_tensor for pipeline: {image_tensor.shape} (expected: 1,T,C,H,W)")
 
             data_batch = {
                 "image": image_tensor,
                 "context_index": torch.zeros(1, 1, dtype=torch.long),  # Controls which G-buffer to generate
-                "noise_level": torch.tensor([noise_level], dtype=torch.long),
             }
 
             for gbuffer_pass in inference_passes:
@@ -322,17 +326,20 @@ class Cosmos1InverseRenderer:
                 # This is required for inverse renderer (matches official implementation)
                 context_index = GBUFFER_INDEX_MAPPING[gbuffer_pass]
                 data_batch["context_index"].fill_(context_index)
+                print(f"[Nodes] Running {gbuffer_pass} pass with context_index={context_index}")
 
                 output_tensor = pipeline.generate_video(
                     data_batch=data_batch,
                     normalize_normal=(gbuffer_pass == 'normal'),
                     seed=seed + i, # Use a different seed for each image in the batch
                 )
+                print(f"[Nodes] {gbuffer_pass} output shape: {output_tensor.shape}")
                 batch_outputs[gbuffer_pass].append(output_tensor)
             pbar.update(1)
 
         # Stack results from all videos in the batch
         outputs = {pass_name: torch.cat(batch_outputs[pass_name], dim=0) for pass_name in inference_passes}
+        print(f"[Nodes] Final outputs shapes: {[(k, v.shape) for k, v in outputs.items()]}")
         
         # Return in official order: basecolor, metallic, roughness, normal, depth
         return (outputs["basecolor"], outputs["metallic"], outputs["roughness"], outputs["normal"], outputs["depth"])
@@ -368,7 +375,7 @@ class Cosmos1ForwardRenderer:
     CATEGORY = "Cosmos1"
 
     def run_forward_pass(self, pipeline, depth, normal, roughness, metallic, base_color, env_map, 
-                        guidance=2.0, seed=42, env_format="proj", env_brightness=1.0, 
+                        guidance=0.0, seed=42, env_format="ball", env_brightness=1.0, 
                         env_flip_horizontal=False, env_flip_vertical=False, env_rotation=0.0):
         # Set model type based on node being used (forward renderer)
         pipeline.set_model_type("forward")
@@ -383,16 +390,24 @@ class Cosmos1ForwardRenderer:
             "env_map": env_map,
         }
 
+        print(f"[Nodes] Forward renderer input tensor types and shapes:")
+        for name, tensor in gbuffer_tensors.items():
+            print(f"[Nodes]   {name}: {type(tensor)}, shape: {tensor.shape if hasattr(tensor, 'shape') else 'no shape'}")
+
         # Standardize tensors and handle lists
         for name, tensor in gbuffer_tensors.items():
+            original_shape = tensor.shape if hasattr(tensor, 'shape') else 'unknown'
             if isinstance(tensor, list):
                 tensor = torch.stack(tensor)
+                print(f"[Nodes] Stacked {name} list: {original_shape} -> {tensor.shape}")
             if tensor.ndim == 4:
                 tensor = tensor.unsqueeze(0) # Add batch dimension
+                print(f"[Nodes] Added batch dim to {name}: {tensor.shape}")
             gbuffer_tensors[name] = tensor
 
         # Get dimensions from the primary input
         B, T, H, W, C = gbuffer_tensors["depth"].shape
+        print(f"[Nodes] Primary dimensions from depth: B={B}, T={T}, H={H}, W={W}, C={C}")
 
         # Configure pipeline with runtime parameters
         pipeline.guidance = guidance
@@ -407,6 +422,7 @@ class Cosmos1ForwardRenderer:
 
         # Process each video in the batch
         for i in range(B):
+            print(f"[Nodes] Processing forward batch {i}/{B}")
             # Prepare G-buffer inputs for the current video
             # Note: Forward renderer does NOT use context_index - it processes all G-buffers simultaneously
             # This matches the official implementation where all maps are fed together
@@ -422,14 +438,18 @@ class Cosmos1ForwardRenderer:
             
             for name in ["depth", "normal", "roughness", "metallic", "base_color"]:
                 tensor_slice = gbuffer_tensors[name][i] # (T, H, W, C)
+                print(f"[Nodes]   {name} slice shape: {tensor_slice.shape}")
                 # Pipeline expects (1, T, C, H, W) and range [-1, 1]
                 # ComfyUI provides data in [0, 1], official expects [-1, 1]
                 processed_tensor = tensor_slice.permute(0, 3, 1, 2).unsqueeze(0)
+                print(f"[Nodes]   {name} processed shape: {processed_tensor.shape} (expected: 1,T,C,H,W)")
                 official_key = key_mapping[name]
                 data_batch[official_key] = processed_tensor * 2.0 - 1.0
 
             # Process the environment map for the current video
             env_map_slice = gbuffer_tensors["env_map"][i] # (T, H, W, C)
+            print(f"[Nodes] env_map slice shape: {env_map_slice.shape}")
+            
             
             # Use the new robust environment map processing system if available
             if ENVMAP_SYSTEM_AVAILABLE:

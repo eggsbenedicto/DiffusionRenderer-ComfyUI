@@ -14,72 +14,45 @@
 # limitations under the License.
 
 """
-Clean implementation of Video VAE/Tokenizer using diffusers AutoencoderKLCosmos.
-Based on the official cosmos_predict1.diffusion.module.pretrained_vae implementation.
+Minimal wrapper around diffusers AutoencoderKLCosmos for video support.
+Handles 4D tensor interface (T, C, H, W) and leverages diffusers' native 5D support.
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional, Any
-from einops import rearrange
-import os
-import math
-
+from typing import Tuple
 from diffusers import AutoencoderKLCosmos
-
-
-# Hardcoded path to the trusted VAE configuration file.
-# This ensures we always load the correct model architecture.
-
-script_directory = os.path.dirname(os.path.abspath(__file__))
-VAE_CONFIG_PATH = os.path.join(script_directory, "VAE_config.json")
 
 class CleanVAE:
     """
-    Clean implementation of Video VAE using diffusers AutoencoderKLCosmos.
-    Handles spatial and temporal compression for video diffusion models.
+    Minimal wrapper around diffusers AutoencoderKLCosmos for video support.
+    Handles 4D tensor interface (T, C, H, W) while leveraging diffusers' native 5D functionality.
     """
     
-    def __init__(self, vae_model: 'AutoencoderKLCosmos', temporal_compression_ratio: int = 8):
+    def __init__(self, vae_model: AutoencoderKLCosmos, temporal_compression_ratio: int = 8):
         """
-        Initialize the VAE with a loaded diffusers model.
+        Initialize with a pre-loaded diffusers VAE model.
         
         Args:
-            vae_model: An already-loaded AutoencoderKLCosmos model from diffusers
+            vae_model: Already-loaded AutoencoderKLCosmos from diffusers
             temporal_compression_ratio: Temporal compression factor (default 8)
         """
         if vae_model is None:
-            raise ValueError("vae_model is required. Load VAE model externally and pass it to this constructor.")
+            raise ValueError("vae_model is required")
             
         self.model = vae_model
         self.config = vae_model.config
+        self.temporal_compression_ratio = temporal_compression_ratio
         
-        # Core parameters from diffusers config
+        # Essential properties for compatibility with existing pipeline code
         self.latent_ch = self.config.latent_channels
         self.spatial_compression_ratio = self.config.spatial_compression_ratio
-        self.temporal_compression_ratio = temporal_compression_ratio  # Not in diffusers config
         
-        # Calculate spatial resolution from config
-        # The config has a 'resolution' field which is the target resolution
-        self.spatial_resolution = (self.config.resolution, self.config.resolution)
-        
-        # Batch processing limits (for memory management)
-        self.max_enc_batch_size = 8
-        self.max_dec_batch_size = 4
-        
-        # Device and dtype settings
-        self.device = next(self.model.parameters()).device if hasattr(self.model, 'parameters') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.dtype = torch.bfloat16
-        
-        print(f"CleanVAE initialized with diffusers model:")
-        print(f"  Model class: {self.config._class_name}")
-        print(f"  Latent channels: {self.latent_ch}")
-        print(f"  Spatial resolution: {self.spatial_resolution[1]}x{self.spatial_resolution[0]}")
-        print(f"  Spatial compression: {self.spatial_compression_ratio}x")
-        print(f"  Temporal compression: {self.temporal_compression_ratio}x")
-        print(f"  Scaling factor: {self.config.scaling_factor}")
-        
+        print(f"CleanVAE initialized:")
+        print(f"  - Latent channels: {self.latent_ch}")
+        print(f"  - Spatial compression: {self.spatial_compression_ratio}x")
+        print(f"  - Temporal compression: {self.temporal_compression_ratio}x")
+    
     def get_latent_num_frames(self, num_pixel_frames: int) -> int:
         """Calculate number of latent frames from pixel frames"""
         if num_pixel_frames == 1:
@@ -95,187 +68,116 @@ class CleanVAE:
             
         # Reverse the temporal compression calculation
         return (num_latent_frames - 1) * self.temporal_compression_ratio + 1
-        
-    def transform_encode_state_shape(self, state: torch.Tensor) -> torch.Tensor:
-        """
-        Transform input state for chunked encoding.
-        For now, this is a pass-through, but in full implementation
-        this would handle temporal chunking for long videos.
-        """
-        return state
-        
-    def transform_decode_state_shape(self, latent: torch.Tensor) -> torch.Tensor:
-        """
-        Transform latent for chunked decoding.
-        For now, this is a pass-through, but in full implementation
-        this would handle temporal chunking for long videos.
-        """
-        return latent
-        
+    
     @torch.no_grad()
     def encode(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Encode pixel space video to latent space.
+        Encode video/image from pixel space to latent space.
         
         Args:
-            state: Input tensor (B, C, T, H, W) in range [0, 1] or [-1, 1]
+            state: (T, C, H, W) - temporal, channel, height, width
             
         Returns:
-            Latent tensor (B, latent_ch, latent_T, latent_H, latent_W)
+            latent: (latent_ch, T_compressed, latent_H, latent_W)
         """
+        print(f"[VAE] encode input shape: {state.shape} (expected 4D: T,C,H,W)")
+        if state.ndim != 4:
+            raise ValueError(f"Expected 4D input (T, C, H, W), got {state.ndim}D with shape {state.shape}")
+        
         original_dtype = state.dtype
-        B, C, T, H, W = state.shape
-
-        # Validate and conform spatial resolution
-        expected_resolution = self.spatial_resolution
-        if (H, W) != expected_resolution:
-            print(f"Warning: Input resolution ({W}x{H}) mismatches VAE config ({expected_resolution[1]}x{expected_resolution[0]}). Resizing input.")
-            # Reshape for interpolation (B*T, C, H, W)
-            state_reshaped = state.view(-1, C, H, W)
-            
-            state_resized = F.interpolate(
-                state_reshaped,
-                size=expected_resolution,
-                mode='bilinear',
-                align_corners=False
-            )
-            
-            # Reshape back to original 5D tensor
-            state = state_resized.view(B, C, T, *expected_resolution)
-            B, C, T, H, W = state.shape # Update dimensions
+        T, C, H, W = state.shape
         
-        print(f"VAE encode: {state.shape} -> ", end="")
+        print(f"[VAE] encode: {state.shape} -> ", end="")
         
-        # Handle single frame vs video differently
+        # Calculate target shape with temporal compression
         if T == 1:
-            # Single frame: no temporal compression
             latent_T = 1
-            latent_H = H // self.spatial_compression_ratio
-            latent_W = W // self.spatial_compression_ratio
         else:
-            # Video: apply temporal compression
             latent_T = self.get_latent_num_frames(T)
-            latent_H = H // self.spatial_compression_ratio
-            latent_W = W // self.spatial_compression_ratio
-            
-        target_shape = (B, self.latent_ch, latent_T, latent_H, latent_W)
+        
+        latent_H = H // self.spatial_compression_ratio
+        latent_W = W // self.spatial_compression_ratio
+        target_shape = (self.latent_ch, latent_T, latent_H, latent_W)
         print(f"{target_shape}")
         
-        # Use diffusers VAE model
-        state = state.to(device=self.device, dtype=self.dtype)
+        # Convert to 5D format for diffusers: (T, C, H, W) -> (1, C, T, H, W)
+        state_5d = state.unsqueeze(0).permute(0, 2, 1, 3, 4)  # (1, C, T, H, W)
+        print(f"[VAE] converted to 5D for diffusers: {state_5d.shape}")
         
-        # Process each frame through the VAE encoder
-        # Note: diffusers VAE expects 4D input (B, C, H, W)
-        encoded_frames = []
-        for t in range(T):
-            frame = state[:, :, t, :, :]  # (B, C, H, W)
-            
-            # Use diffusers encode method
-            encoded = self.model.encode(frame)
-            latent_dist = encoded.latent_dist
-            latent_frame = latent_dist.sample()  # Sample from the distribution
-            
-            # Apply scaling factor
-            latent_frame = latent_frame * self.config.scaling_factor
-            
-            encoded_frames.append(latent_frame)
+        # Use diffusers' native 5D encode method
+        encoded = self.model.encode(state_5d)
+        latent_5d = encoded.latent_dist.sample()  # (1, latent_ch, T_compressed, latent_H, latent_W)
+        print(f"[VAE] diffusers encode output (5D): {latent_5d.shape}")
         
-        # Stack frames back into 5D tensor
-        if T == 1:
-            encoded_state = encoded_frames[0].unsqueeze(2)  # Add temporal dimension
-        else:
-            # For video, apply temporal compression
-            encoded_state = torch.stack(encoded_frames, dim=2)  # (B, C, T, H, W)
-            
-            # Apply temporal compression if needed
-            if T != latent_T:
-                # Simple temporal downsampling for now
-                # In a full implementation, this would use learned temporal compression
-                encoded_state = F.interpolate(
-                    encoded_state.permute(0, 1, 3, 4, 2),  # (B, C, H, W, T)
-                    size=latent_T,
-                    mode='linear',
-                    align_corners=False
-                ).permute(0, 1, 4, 2, 3)  # Back to (B, C, T, H, W)
+        # Convert back to 4D format: (1, latent_ch, T_compressed, latent_H, latent_W) -> (latent_ch, T_compressed, latent_H, latent_W)
+        latent_4d = latent_5d.squeeze(0)
+        print(f"[VAE] final output (4D): {latent_4d.shape}")
         
-        return encoded_state.to(original_dtype)
-            
+        return latent_4d.to(original_dtype)
+    
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent space representation to pixel space video.
+        Decode from latent space to pixel space.
         
         Args:
-            latent: Latent tensor (B, latent_ch, latent_T, latent_H, latent_W)
+            latent: (latent_ch, T_compressed, latent_H, latent_W)
             
         Returns:
-            Pixel tensor (B, 3, pixel_T, pixel_H, pixel_W) in range [-1, 1]
+            decoded: (T, C, H, W)
         """
+        print(f"[VAE] decode input shape: {latent.shape} (expected 4D: latent_ch,T,H,W)")
+        if latent.ndim != 4:
+            raise ValueError(f"Expected 4D input (latent_ch, T, latent_H, latent_W), got {latent.ndim}D with shape {latent.shape}")
+        
         original_dtype = latent.dtype
-        B, C, latent_T, latent_H, latent_W = latent.shape
+        C, latent_T, latent_H, latent_W = latent.shape
         
-        print(f"VAE decode: {latent.shape} -> ", end="")
+        print(f"[VAE] decode: {latent.shape} -> ", end="")
         
-        # Calculate output dimensions
+        # Calculate output dimensions with temporal decompression
         if latent_T == 1:
-            # Single frame: no temporal decompression
             pixel_T = 1
         else:
-            # Video: apply temporal decompression
             pixel_T = self.get_pixel_num_frames(latent_T)
             
         pixel_H = latent_H * self.spatial_compression_ratio
         pixel_W = latent_W * self.spatial_compression_ratio
-        target_shape = (B, 3, pixel_T, pixel_H, pixel_W)
+        target_shape = (pixel_T, 3, pixel_H, pixel_W)
         print(f"{target_shape}")
         
-        # Use diffusers VAE model
-        latent = latent.to(device=self.device, dtype=self.dtype)
+        # Convert to 5D format for diffusers: (latent_ch, T, latent_H, latent_W) -> (1, latent_ch, T, latent_H, latent_W)
+        latent_5d = latent.unsqueeze(0)  # (1, latent_ch, T, latent_H, latent_W)
+        print(f"[VAE] converted to 5D for diffusers: {latent_5d.shape}")
         
-        # Apply temporal decompression if needed
+        # Use diffusers' native 5D decode method
+        decoded_5d = self.model.decode(latent_5d)
+        pixel_5d = decoded_5d.sample  # (1, 3, T, pixel_H, pixel_W)
+        print(f"[VAE] diffusers decode output (5D): {pixel_5d.shape}")
         
-        # Process each frame through the VAE decoder
-        # Note: diffusers VAE expects 4D input (B, C, H, W)
-        decoded_frames = []
-        for t in range(pixel_T):
-            latent_frame = latent[:, :, t, :, :]  # (B, C, H, W)
-            
-            # Remove scaling factor before decoding
-            latent_frame = latent_frame / self.config.scaling_factor
-            
-            # Use diffusers decode method
-            decoded_frame = self.model.decode(latent_frame).sample
-            
-            decoded_frames.append(decoded_frame)
+        # Convert back to 4D format: (1, 3, T, pixel_H, pixel_W) -> (T, 3, pixel_H, pixel_W)
+        pixel_4d = pixel_5d.squeeze(0).permute(1, 0, 2, 3)  # (T, 3, pixel_H, pixel_W)
+        print(f"[VAE] final output (4D): {pixel_4d.shape}")
         
-        # Stack frames back into 5D tensor
-        if pixel_T == 1:
-            decoded_state = decoded_frames[0].unsqueeze(2)  # Add temporal dimension
-        else:
-            decoded_state = torch.stack(decoded_frames, dim=2)  # (B, C, T, H, W)
-        
-        return decoded_state.to(original_dtype)
-        return self.temporal_compression_ratio
-        
+        return pixel_4d.to(original_dtype)
+    
+    # Compatibility properties for existing pipeline code
     @property
     def spatial_resolution(self) -> Tuple[int, int]:
         """Get the configured spatial resolution (H, W)."""
-        return self.spatial_resolution
-
+        return (self.config.resolution, self.config.resolution)
+    
     @property
     def channel(self) -> int:
         """Get number of latent channels"""
         return self.latent_ch
-
-    def reset_dtype(self, dtype: torch.dtype):
-        """Reset the dtype for the VAE"""
-        self.dtype = dtype
-        
-    def to(self, device: torch.device):
-        """Move VAE to specified device"""
-        self.device = device
+    
+    def to(self, device):
+        """Move VAE to device"""
         self.model = self.model.to(device)
         return self
-
-
-# Clean, simple interface - no backward compatibility cruft needed
+    
+    def reset_dtype(self, dtype: torch.dtype):
+        """Reset the dtype for the VAE (for compatibility)"""
+        # Note: diffusers handles dtype internally
+        pass

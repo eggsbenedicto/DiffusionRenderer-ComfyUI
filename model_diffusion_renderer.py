@@ -23,7 +23,8 @@ import torch
 import torch.nn as nn
 from typing import Dict, Tuple, Union, Optional, Any
 from torch import Tensor
-from CleanVAE import CleanVAE
+from .CleanVAE import CleanVAE
+from .CleanGeneralDIT import CleanDiffusionRendererGeneralDIT
 
 
 class CleanEDMEulerScheduler:
@@ -130,7 +131,7 @@ class CleanConditioner:
         uncondition_data = {}
         
         # Copy relevant conditioning information
-        for key in ['latent_condition', 'context_index', 'noise_level']:
+        for key in ['latent_condition', 'context_index']:
             if key in data_batch:
                 condition_data[key] = data_batch[key]
                 # For uncondition, zero out conditioning signals for proper CFG
@@ -140,9 +141,6 @@ class CleanConditioner:
                 elif key == 'context_index':
                     # Zero out context indices for unconditional branch
                     uncondition_data[key] = torch.zeros_like(data_batch[key])
-                else:
-                    # Keep noise_level the same for both branches
-                    uncondition_data[key] = data_batch[key]
         
         return CleanCondition(**condition_data), CleanCondition(**uncondition_data)
 
@@ -155,9 +153,6 @@ class CleanDiffusionRendererModel(nn.Module):
     
     def __init__(self, config: Dict[str, Any] = None):
         super().__init__()
-        
-        # Import here to avoid circular imports
-        from CleanGeneralDIT import CleanDiffusionRendererGeneralDIT
         
         # Use provided config or create default
         if config is None:
@@ -185,7 +180,16 @@ class CleanDiffusionRendererModel(nn.Module):
         self.vae = self._create_mock_vae(vae_config)
         
         # Configuration from config dict
-        self.condition_keys = config.get('condition_keys', ["image", "depth", "normal", "basecolor", "roughness", "metallic"])
+        # For inverse rendering: condition only on the input image (like official implementation)
+        # For forward rendering: condition on all G-buffer inputs
+        model_type = config.get('model_type', 'inverse')
+        if model_type == 'inverse':
+            # Inverse rendering: RGB image -> G-buffers (one at a time via context_index)
+            self.condition_keys = config.get('condition_keys', ["image"])
+        else:
+            # Forward rendering: G-buffers -> RGB image
+            self.condition_keys = config.get('condition_keys', ["depth", "normal", "basecolor", "roughness", "metallic"])
+        
         self.condition_drop_rate = config.get('condition_drop_rate', 0.0)
         self.append_condition_mask = config.get('append_condition_mask', True)
         self.input_data_key = config.get('input_data_key', "video")  # Will be set dynamically
@@ -340,11 +344,33 @@ class CleanDiffusionRendererModel(nn.Module):
         
     def encode(self, x: Tensor) -> Tensor:
         """VAE encode wrapper"""
-        return self.vae.encode(x)
+        print(f"[Model] encode input shape before VAE: {x.shape}")
+        
+        # VAE expects 4D: (T, C, H, W), but model may pass 5D: (B, C, T, H, W)
+        if x.ndim == 5 and x.shape[0] == 1:
+            x = x.squeeze(0)  # (C, T, H, W)
+            print(f"[Model] after squeeze batch: {x.shape}")
+        
+        # VAE expects (T, C, H, W), but we might have (C, T, H, W)
+        if x.shape[0] == self.vae.latent_ch or (x.shape[0] == 3 and x.shape[1] > 3):
+            x = x.permute(1, 0, 2, 3)  # (T, C, H, W)
+            print(f"[Model] after permute for VAE: {x.shape}")
+        
+        latent = self.vae.encode(x)
+        print(f"[Model] VAE encode output shape: {latent.shape}")
+        return latent
         
     def decode(self, x: Tensor) -> Tensor:
         """VAE decode wrapper"""
-        return self.vae.decode(x)
+        print(f"[Model] decode input latent shape: {x.shape}")
+        decoded = self.vae.decode(x)
+        print(f"[Model] VAE decode output shape: {decoded.shape}")
+        
+        # Ensure output is properly shaped for downstream processing
+        if decoded.ndim == 4:
+            print(f"[Model] VAE output is 4D (T,C,H,W), keeping as is")
+        
+        return decoded
         
     def prepare_diffusion_renderer_latent_conditions(
         self, 
@@ -361,6 +387,9 @@ class CleanDiffusionRendererModel(nn.Module):
         
         if condition_keys is None:
             condition_keys = self.condition_keys
+
+        #official latent shape: latent_shape = (B, 16, T // 8 + 1, H // 8, W // 8)
+        #we're trying a dynamic latent shape
             
         if latent_shape is None:
             # Get shape from config if available
@@ -477,47 +506,34 @@ class CleanDiffusionRendererModel(nn.Module):
             
             # Initialize noise
             xt = torch.randn(size=(n_sample,) + tuple(state_shape), **tensor_kwargs) * self.scheduler.init_noise_sigma
+            print(f"[Model] Initialized noise shape: {xt.shape} with state_shape: {state_shape}")
             
             # Denoising loop with proper EDM Euler integration
             for i, t in enumerate(self.scheduler.timesteps):
                 xt = xt.to(**tensor_kwargs)
                 xt_scaled = self.scheduler.scale_model_input(xt, timestep=t)
+                print(f"[Model] Step {i+1}/{num_steps}: xt_scaled shape: {xt_scaled.shape}")
                 
                 # Predict the noise residual  
                 t = t.to(**tensor_kwargs)
                 
-                # Prepare inputs for the real neural network
-                net_input = {
-                    'x': xt_scaled,
-                    'timesteps': t,
-                    'crossattn_emb': condition.to_dict().get('latent_condition'),
-                    'context_index': condition.to_dict().get('context_index'),
-                    'latent_condition': condition.to_dict().get('latent_condition')
-                }
-                
-                # Remove None values
-                net_input = {k: v for k, v in net_input.items() if v is not None}
-                
                 print(f"Step {i+1}/{num_steps}: sigma={float(t):.4f}")
                 
-                net_output_cond = self.net(**net_input)
+                # Use official parameter passing - clean and correct
+                net_output_cond = self.net(x=xt_scaled, timesteps=t, **condition.to_dict())
+                print(f"[Model] net_output_cond shape: {net_output_cond.shape}")
                 net_output = net_output_cond
                 
                 if guidance > 0:
-                    uncond_input = net_input.copy()
-                    uncond_input.update({
-                        'crossattn_emb': uncondition.to_dict().get('latent_condition'),
-                        'context_index': uncondition.to_dict().get('context_index'),
-                        'latent_condition': uncondition.to_dict().get('latent_condition')
-                    })
-                    uncond_input = {k: v for k, v in uncond_input.items() if v is not None}
-                    
-                    net_output_uncond = self.net(**uncond_input)
+                    net_output_uncond = self.net(x=xt_scaled, timesteps=t, **uncondition.to_dict())
                     net_output = net_output_cond + guidance * (net_output_cond - net_output_uncond)
+                    print(f"[Model] guided net_output shape: {net_output.shape}")
                     
                 # Compute the previous noisy sample x_t -> x_t-1 using proper Euler integration
                 xt = self.scheduler.step(net_output, t, xt).prev_sample
+                print(f"[Model] After scheduler step, xt shape: {xt.shape}")
                 
             samples = xt
+            print(f"[Model] Final samples shape: {samples.shape}")
             
             return samples
