@@ -184,13 +184,35 @@ class OfficialVideoAttn(nn.Module):
         self.head_dim = x_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Match checkpoint naming: attn.to_q.0.weight etc.
-        self.attn = nn.ModuleDict({
-            'to_q': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
-            'to_k': nn.Sequential(nn.Linear(context_dim if context_dim else x_dim, x_dim, bias=bias)),
-            'to_v': nn.Sequential(nn.Linear(context_dim if context_dim else x_dim, x_dim, bias=bias)),
-            'to_out': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
-        })
+        # Match checkpoint naming: attn.to_q.0.weight and attn.to_q.1.weight (for cross-attention)
+        # Cross-attention blocks have 2 layers: [Linear, Linear] -> to_q.1.weight
+        # Self-attention blocks have 1 layer: [Linear] -> to_q.0.weight
+        is_cross_attn = context_dim is not None
+        
+        if is_cross_attn:
+            # Cross-attention: uses 2-layer structure
+            self.attn = nn.ModuleDict({
+                'to_q': nn.Sequential(
+                    nn.Linear(x_dim, x_dim, bias=bias),
+                    nn.Linear(x_dim, x_dim, bias=bias)
+                ),
+                'to_k': nn.Sequential(
+                    nn.Linear(context_dim, x_dim, bias=bias),
+                    nn.Linear(x_dim, x_dim, bias=bias)
+                ),
+                'to_v': nn.Sequential(
+                    nn.Linear(context_dim, x_dim, bias=bias)
+                ),
+                'to_out': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
+            })
+        else:
+            # Self-attention: uses 1-layer structure  
+            self.attn = nn.ModuleDict({
+                'to_q': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
+                'to_k': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
+                'to_v': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
+                'to_out': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
+            })
     def forward(self, x, context=None, crossattn_mask=None, rope_emb_L_1_1_D=None):
         """
         x: (T, H, W, B, D) - official format
@@ -205,14 +227,17 @@ class OfficialVideoAttn(nn.Module):
         if context is not None:
             context = rearrange(context, "m b d -> b m d")  # (B, M, D)
             k_input = v_input = context
+            # Cross-attention: use 2-layer structure
+            q = self.attn['to_q'][1](self.attn['to_q'][0](x_seq)).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.attn['to_k'][1](self.attn['to_k'][0](k_input)).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.attn['to_v'][0](v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         else:
             k_input = v_input = x_seq
+            # Self-attention: use 1-layer structure
+            q = self.attn['to_q'][0](x_seq).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            k = self.attn['to_k'][0](k_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            v = self.attn['to_v'][0](v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
             
-        # Compute attention using checkpoint naming structure
-        q = self.attn['to_q'][0](x_seq).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.attn['to_k'][0](k_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.attn['to_v'][0](v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        
         # Apply RoPE if provided
         if rope_emb_L_1_1_D is not None and context is None:  # Only for self-attention
             rope_emb = rope_emb_L_1_1_D.squeeze(1).squeeze(1)  # (L, D)
@@ -586,13 +611,10 @@ class CleanGeneralDIT(nn.Module):
             self.rope_handler = None
             
         # Create pos_embedder with seq parameter to match checkpoint: net.pos_embedder.seq
-        max_seq_len = (self.max_frames // self.patch_temporal) * \
-                     (self.max_img_h // self.patch_spatial) * \
-                     (self.max_img_w // self.patch_spatial)
-        
-        # Use nn.Module with registered parameter to match checkpoint structure
+        # Checkpoint expects small size (128,) not massive (1843200, 4096)
+        # This is likely for RoPE frequency parameters, not full sequence embedding
         self.pos_embedder = nn.Module()
-        self.pos_embedder.seq = nn.Parameter(torch.randn(max_seq_len, self.model_channels) * 0.02)
+        self.pos_embedder.seq = nn.Parameter(torch.randn(128) * 0.02)  # Match checkpoint shape
             
     def _build_blocks(self):
         """Build transformer blocks using official structure"""
