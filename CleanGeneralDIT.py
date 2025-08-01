@@ -76,11 +76,13 @@ class CleanTimesteps(nn.Module):
 class CleanTimestepEmbedding(nn.Module):
     """Clean implementation of timestep embedding MLP"""
 
-    def __init__(self, in_channels: int, out_channels: int, time_embed_dim: int, act_fn: str = "silu"):
+    def __init__(self, in_channels: int, out_channels: int, use_adaln_lora: bool = False, act_fn: str = "silu"):
         super().__init__()
         self.linear_1 = nn.Linear(in_channels, out_channels)
         self.act = nn.SiLU() if act_fn == "silu" else nn.GELU()
-        self.linear_2 = nn.Linear(out_channels, time_embed_dim)
+        # Official implementation outputs out_channels * 3 in the second linear
+        self.linear_2 = nn.Linear(out_channels, out_channels * 3)
+        self.use_adaln_lora = use_adaln_lora
         
     def forward(self, sample):
         sample = self.linear_1(sample)
@@ -314,7 +316,7 @@ class CleanDITBlock(nn.Module):
 class CleanFinalLayer(nn.Module):
     """Final layer to decode from hidden dim to output channels"""
     
-    def __init__(self, hidden_size: int, spatial_patch_size: int, temporal_patch_size: int, out_channels: int):
+    def __init__(self, hidden_size: int, spatial_patch_size: int, temporal_patch_size: int, out_channels: int, adaln_lora_dim: int = 256):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
@@ -324,7 +326,7 @@ class CleanFinalLayer(nn.Module):
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 256, bias=True)
+            nn.Linear(hidden_size, adaln_lora_dim, bias=True)
         )
         self.spatial_patch_size = spatial_patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -363,7 +365,6 @@ class CleanGeneralDIT(nn.Module):
         num_heads: int = 32,
         mlp_ratio: float = 4.0,
         block_config: str = "FA-CA-MLP",
-
         
         # Cross attention
         crossattn_emb_channels: int = 4096,
@@ -371,6 +372,10 @@ class CleanGeneralDIT(nn.Module):
         
         # Position embedding
         pos_emb_cls: str = "rope3d",
+        
+        # AdaLN LoRA
+        use_adaln_lora: bool = False,
+        adaln_lora_dim: int = 256,
         
         # Additional features
         affline_emb_norm: bool = True,
@@ -391,6 +396,8 @@ class CleanGeneralDIT(nn.Module):
         self.concat_padding_mask = concat_padding_mask
         self.use_cross_attn_mask = use_cross_attn_mask
         self.crossattn_emb_channels = crossattn_emb_channels
+        self.use_adaln_lora = use_adaln_lora
+        self.adaln_lora_dim = adaln_lora_dim
         
         # Build components
         self._build_patch_embed()
@@ -425,7 +432,7 @@ class CleanGeneralDIT(nn.Module):
         """Build timestep embedding"""
         self.t_embedder = nn.Sequential(
             CleanTimesteps(self.model_channels),
-            CleanTimestepEmbedding(self.model_channels, self.model_channels * 3)
+            CleanTimestepEmbedding(self.model_channels, self.model_channels, use_adaln_lora=self.use_adaln_lora)
         )
         
     def _build_pos_embed(self):
@@ -459,7 +466,8 @@ class CleanGeneralDIT(nn.Module):
             hidden_size=self.model_channels,
             spatial_patch_size=self.patch_spatial,
             temporal_patch_size=self.patch_temporal,
-            out_channels=self.out_channels
+            out_channels=self.out_channels,
+            adaln_lora_dim=self.adaln_lora_dim
         )
         
     def initialize_weights(self):
