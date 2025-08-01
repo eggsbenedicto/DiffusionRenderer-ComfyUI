@@ -75,12 +75,12 @@ class CleanTimesteps(nn.Module):
 
 class CleanTimestepEmbedding(nn.Module):
     """Clean implementation of timestep embedding MLP"""
-    
-    def __init__(self, in_channels: int, out_channels: int, time_embed_dim: int, act_fn: str = "silu",):
+
+    def __init__(self, in_channels: int, out_channels: int, time_embed_dim: int, act_fn: str = "silu"):
         super().__init__()
         self.linear_1 = nn.Linear(in_channels, out_channels)
         self.act = nn.SiLU() if act_fn == "silu" else nn.GELU()
-        self.linear_2 = nn.Linear(out_channels, out_channels * 3)
+        self.linear_2 = nn.Linear(out_channels, time_embed_dim)
         
     def forward(self, sample):
         sample = self.linear_1(sample)
@@ -425,7 +425,7 @@ class CleanGeneralDIT(nn.Module):
         """Build timestep embedding"""
         self.t_embedder = nn.Sequential(
             CleanTimesteps(self.model_channels),
-            CleanTimestepEmbedding(self.model_channels, self.model_channels)
+            CleanTimestepEmbedding(self.model_channels, self.model_channels * 3)
         )
         
     def _build_pos_embed(self):
@@ -605,7 +605,7 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         if self.use_context_embedding:
             self.context_embedding = nn.Embedding(
                 num_embeddings=16,  # For different G-buffer types
-                embedding_dim=kwargs.get('crossattn_emb_channels', 4096)
+                embedding_dim=kwargs.get('crossattn_emb_channels')
             )
             # Initialize context embeddings
             with torch.no_grad():

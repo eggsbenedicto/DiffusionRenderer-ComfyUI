@@ -223,7 +223,7 @@ class CleanDiffusionRendererPipeline:
         # Load checkpoint if it exists
         
         print(f"Loading checkpoint from: {checkpoint_path}")
-        model.load_checkpoint(checkpoint_path, strict=False)
+        model.load_checkpoint(checkpoint_path, strict=True)
         
         # Move to device
         model = model.to(self.device)

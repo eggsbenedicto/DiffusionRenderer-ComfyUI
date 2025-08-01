@@ -283,7 +283,7 @@ class CleanDiffusionRendererModel(nn.Module):
         else:
             raise NotImplementedError("Use generate_samples_from_batch() for diffusion sampling")
     
-    def load_checkpoint(self, checkpoint_path: str, strict: bool = False):
+    def load_checkpoint(self, checkpoint_path: str, strict: bool = True):
         """Load checkpoint using standard PyTorch methods"""
         print(f"Loading checkpoint from: {checkpoint_path}")
         
@@ -320,7 +320,7 @@ class CleanDiffusionRendererModel(nn.Module):
                     state_dict = checkpoint
             
             # Load state dict with error handling
-            missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=strict)
+            missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=True)
             
             # Report loading results
             print(f"Checkpoint loaded successfully:")
