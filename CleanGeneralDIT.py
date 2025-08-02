@@ -689,16 +689,28 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         self.use_context_embedding = use_context_embedding
         super().__init__(**kwargs)
 
+        # init context embedding
+        if self.use_context_embedding:
+            self.context_embedding = nn.Embedding(num_embeddings=16,
+                                                        embedding_dim=kwargs["crossattn_emb_channels"])
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(42)
+            torch.nn.init.uniform_(self.context_embedding.weight, -0.3, 0.3)
+            torch.set_rng_state(rng_state)
+
     def _build_patch_embed(self):
         """
         Override to adjust input channels for latent_condition.
         """
-        in_channels = self.in_channels + self.additional_concat_ch
+        in_channels = self.in_channels
+        if self.additional_concat_ch is not None:
+             in_channels += self.additional_concat_ch
+        
         if self.concat_padding_mask:
             in_channels += 1
         
         self.x_embedder = CleanPatchEmbed(
-            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=True
+            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=False
         )
 
     def prepare_inputs(self, x, timesteps, crossattn_emb, padding_mask=None, latent_condition=None):
@@ -721,25 +733,42 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
             rope_emb = self.pos_embedder(shape=(x.shape[1], x.shape[2], x.shape[3]))
             
         return x, emb, adaln_lora, rope_emb
-        self.additional_concat_ch = additional_concat_ch
-        self.use_context_embedding = use_context_embedding
-        super().__init__(**kwargs)
-        
-        if self.use_context_embedding:
-            self.context_embedding = nn.Embedding(16, kwargs["crossattn_emb_channels"])
-            
+
     def forward(
         self,
         x: torch.Tensor,
         timesteps: torch.Tensor,
-        crossattn_emb: torch.Tensor = None,
-        context_index: Optional[torch.Tensor] = None,
-        **kwargs
+        crossattn_emb: torch.Tensor,
+        crossattn_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
+        latent_condition: Optional[torch.Tensor] = None,
+        scalar_feature: Optional[torch.Tensor] = None,
+        context_index = None,
+        **kwargs,
     ) -> torch.Tensor:
+        """
+        Overrides the parent `forward` method. It handles the context_index, and passes all given arguments to the
+        parent method and returns its result.
+        """
         if self.use_context_embedding and context_index is not None:
-            context_emb = self.context_embedding(context_index.long())
-            if context_emb.ndim == 2:
-                context_emb = context_emb.unsqueeze(1)
-            crossattn_emb = context_emb
+            # Overwrite the context embedding
+            input_context_emb = self.context_embedding(context_index.long())
+            if input_context_emb.ndim == 2:
+                input_context_emb = input_context_emb.unsqueeze(1).clone()
+
+            if crossattn_emb is not None:
+                input_context_emb = input_context_emb.repeat_interleave(crossattn_emb.shape[1], dim=1)
             
-        return super().forward(x, timesteps, crossattn_emb, **kwargs)
+            input_context_emb = input_context_emb.to(device=crossattn_emb.device, dtype=crossattn_emb.dtype)
+            crossattn_emb = input_context_emb
+
+        return super().forward(
+            x=x,
+            timesteps=timesteps,
+            crossattn_emb=crossattn_emb,
+            crossattn_mask=crossattn_mask,
+            padding_mask=padding_mask,
+            latent_condition=latent_condition,
+            scalar_feature=scalar_feature,
+            **kwargs,
+        )
