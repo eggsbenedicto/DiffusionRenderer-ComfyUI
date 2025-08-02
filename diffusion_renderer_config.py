@@ -168,7 +168,7 @@ def get_inverse_renderer_config(
             **network_config,
             "additional_concat_ch": 16,  # RGB condition channels
             "use_context_embedding": True,
-            "crossattn_emb_channels": 4096,
+            "crossattn_emb_channels": 1024,  # FIXED: Must match checkpoint expectation!
         },
         
         # Scheduler
@@ -231,7 +231,7 @@ def get_forward_renderer_config(
             **network_config,
             "additional_concat_ch": 17 * 8,  # 136 channels for all condition maps
             "use_context_embedding": False,
-            "crossattn_emb_channels": 4096,
+            "crossattn_emb_channels": 1024,  # FIXED: Must match checkpoint expectation!
         },
         
         # Scheduler

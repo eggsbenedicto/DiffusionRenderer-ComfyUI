@@ -17,13 +17,88 @@
 Clean implementation of GeneralDIT architecture without parallel processing dependencies.
 Based on the original cosmos_predict1.diffusion.networks.general_dit but simplified for inference.
 """
-
+import math
 import torch
-import torch.nn as nn
+from torch import nn
 from typing import Dict, Tuple, Optional, Union
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+
+
+class CleanRoPE3D(nn.Module):
+    """
+    Clean implementation of 3D Rotary Position Embedding, matching the official
+    `VideoRopePosition3DEmb` class for checkpoint compatibility.
+    """
+    def __init__(self, head_dim: int, max_t: int = 128, max_h: int = 240, max_w: int = 240):
+        super().__init__()
+        self.head_dim = head_dim
+        self.max_t = max_t
+        self.max_h = max_h
+        self.max_w = max_w
+        
+        # Split head_dim for each axis, ensuring it matches the official distribution
+        self.d_t = head_dim // 2
+        self.d_h = head_dim // 4
+        self.d_w = head_dim - self.d_t - self.d_h
+        
+        # This parameter is crucial for loading the official checkpoint
+        self.logvar = nn.Parameter(torch.zeros(1))
+        
+        # Create sinusoidal embeddings for each dimension
+        self.t_freqs = self._create_sinusoidal_embeddings(self.d_t, self.max_t)
+        self.h_freqs = self._create_sinusoidal_embeddings(self.d_h, self.max_h)
+        self.w_freqs = self._create_sinusoidal_embeddings(self.d_w, self.max_w)
+        
+        # Register buffers for device management
+        self.register_buffer('cached_t_freqs', self.t_freqs, persistent=False)
+        self.register_buffer('cached_h_freqs', self.h_freqs, persistent=False)
+        self.register_buffer('cached_w_freqs', self.w_freqs, persistent=False)
+        
+        # Caching for efficiency
+        self._cached_embedding = None
+        self._cached_shape = None
+
+    def _create_sinusoidal_embeddings(self, dim, max_len):
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_len).float()
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        return torch.cat((freqs, freqs), dim=-1)
+
+    def forward(self, shape):
+        T, H, W = shape
+        
+        # Return cached embedding if shape matches
+        if self._cached_shape == shape and self._cached_embedding is not None:
+            return self._cached_embedding
+            
+        # Get embeddings for the current shape
+        t_emb = self.cached_t_freqs[:T]
+        h_emb = self.cached_h_freqs[:H]
+        w_emb = self.cached_w_freqs[:W]
+        
+        # Expand dimensions to match the (T, H, W) grid
+        t_emb = t_emb.unsqueeze(1).unsqueeze(1).expand(-1, H, W, -1)
+        h_emb = h_emb.unsqueeze(0).unsqueeze(2).expand(T, -1, W, -1)
+        w_emb = w_emb.unsqueeze(0).unsqueeze(0).expand(T, H, -1, -1)
+        
+        # Concatenate and rearrange to (L, D) where L = T*H*W
+        rope_emb = torch.cat([t_emb, h_emb, w_emb], dim=-1)
+        rope_emb = rearrange(rope_emb, 't h w d -> (t h w) d')
+        
+        # Cache the result
+        self._cached_embedding = rope_emb
+        self._cached_shape = shape
+        
+        return rope_emb
+
+from typing import Dict, Tuple, Optional, Union
+
+import torch
+import torch.nn as nn
 import math
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
 
 
 def rotate_half(x):
@@ -67,9 +142,9 @@ class CleanTimesteps(nn.Module):
         cos_emb = torch.cos(emb)
         
         if self.flip_sin_cos:
-            emb = torch.cat([cos_emb, sin_emb], dim=-1)
-        else:
             emb = torch.cat([sin_emb, cos_emb], dim=-1)
+        else:
+            emb = torch.cat([cos_emb, sin_emb], dim=-1)
 
         return emb
 
@@ -79,7 +154,6 @@ class CleanTimestepEmbedding(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, use_adaln_lora: bool = False, act_fn: str = "silu"):
         super().__init__()
-        # Add bias=True to match checkpoint expectations
         self.linear_1 = nn.Linear(in_channels, out_channels, bias=True)
         self.act = nn.SiLU() if act_fn == "silu" else nn.GELU()
         # Official implementation outputs out_channels * 3 in the second linear
@@ -90,7 +164,8 @@ class CleanTimestepEmbedding(nn.Module):
         sample = self.linear_1(sample)
         sample = self.act(sample)
         sample = self.linear_2(sample)
-        return sample
+        # Return the 3*D tensor and None for lora part
+        return sample, None
 
 
 class CleanPatchEmbed(nn.Module):
@@ -130,47 +205,14 @@ class CleanPatchEmbed(nn.Module):
         return self.out(x)
 
 
-class CleanRoPE3D:
-    """Simplified 3D RoPE (Rotary Position Embedding) for video"""
-    
-    def __init__(self, head_dim: int, max_t: int, max_h: int, max_w: int):
-        self.head_dim = head_dim
-        self.max_t = max_t
-        self.max_h = max_h  
-        self.max_w = max_w
-        
-    def get_rope_embeddings(self, t: int, h: int, w: int, device: torch.device):
-        """Generate 3D rotary embeddings for given dimensions"""
-        # Create position grids
-        pos_t = torch.arange(t, device=device).float()
-        pos_h = torch.arange(h, device=device).float()
-        pos_w = torch.arange(w, device=device).float()
-        
-        # Create frequency bases
-        dim_t = self.head_dim // 6
-        dim_h = self.head_dim // 6  
-        dim_w = self.head_dim // 6
-        
-        # Temporal frequencies
-        freqs_t = 1.0 / (10000 ** (torch.arange(0, dim_t * 2, 2, device=device).float() / (dim_t * 2)))
-        # Spatial frequencies  
-        freqs_h = 1.0 / (10000 ** (torch.arange(0, dim_h * 2, 2, device=device).float() / (dim_h * 2)))
-        freqs_w = 1.0 / (10000 ** (torch.arange(0, dim_w * 2, 2, device=device).float() / (dim_w * 2)))
-        
-        # Create embeddings
-        t_emb = torch.outer(pos_t, freqs_t)
-        h_emb = torch.outer(pos_h, freqs_h)
-        w_emb = torch.outer(pos_w, freqs_w)
-        
-        # Expand to full grid
-        rope_emb = torch.zeros(t, h, w, self.head_dim, device=device)
-        
-        # Fill in the embeddings (simplified version)
-        rope_emb[:, :, :, :dim_t*2] = t_emb[:, None, None, :]
-        rope_emb[:, :, :, dim_t*2:dim_t*2+dim_h*2] = h_emb[None, :, None, :]
-        rope_emb[:, :, :, dim_t*2+dim_h*2:dim_t*2+dim_h*2+dim_w*2] = w_emb[None, None, :, :]
-        
-        return rope_emb
+class DummyWeight(nn.Module):
+    """A dummy module that holds a single weight parameter."""
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x):
+        return x
 
 
 class OfficialVideoAttn(nn.Module):
@@ -178,87 +220,51 @@ class OfficialVideoAttn(nn.Module):
     
     def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, bias: bool = False):
         super().__init__()
-        self.x_dim = x_dim
-        self.context_dim = context_dim
         self.num_heads = num_heads
         self.head_dim = x_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Match checkpoint naming: attn.to_q.0.weight and attn.to_q.1.weight (for cross-attention)
-        # Cross-attention blocks have 2 layers: [Linear, Linear] -> to_q.1.weight
-        # Self-attention blocks have 1 layer: [Linear] -> to_q.0.weight
-        is_cross_attn = context_dim is not None
+        # Use Sequential to get the .0.weight keys
+        self.to_q = nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
         
-        if is_cross_attn:
-            # Cross-attention: uses 2-layer structure
-            self.attn = nn.ModuleDict({
-                'to_q': nn.Sequential(
-                    nn.Linear(x_dim, x_dim, bias=bias),
-                    nn.Linear(x_dim, x_dim, bias=bias)
-                ),
-                'to_k': nn.Sequential(
-                    nn.Linear(context_dim, x_dim, bias=bias),
-                    nn.Linear(x_dim, x_dim, bias=bias)
-                ),
-                'to_v': nn.Sequential(
-                    nn.Linear(context_dim, x_dim, bias=bias)
-                ),
-                'to_out': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
-            })
-        else:
-            # Self-attention: uses 1-layer structure  
-            self.attn = nn.ModuleDict({
-                'to_q': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
-                'to_k': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
-                'to_v': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias)),
-                'to_out': nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
-            })
+        kv_dim = context_dim if context_dim is not None else x_dim
+        self.to_k = nn.Sequential(nn.Linear(kv_dim, x_dim, bias=bias))
+        self.to_v = nn.Sequential(nn.Linear(kv_dim, x_dim, bias=bias))
+        
+        self.to_out = nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
+
+        # Add dummy weights for self-attention to match checkpoint keys
+        if context_dim is None:
+            self.to_q.add_module("1", DummyWeight(128))
+            self.to_k.add_module("1", DummyWeight(128))
+            self.to_v.add_module("1", DummyWeight(128))
+            self.to_out.add_module("1", DummyWeight(128))
+
     def forward(self, x, context=None, crossattn_mask=None, rope_emb_L_1_1_D=None):
-        """
-        x: (T, H, W, B, D) - official format
-        context: (M, B, D) or None for self-attention
-        """
-        T, H, W, B, D = x.shape
+        h = self.num_heads
         
-        # Reshape to sequence format
-        x_seq = rearrange(x, "t h w b d -> (t h w) b d")  # (L, B, D)
-        x_seq = rearrange(x_seq, "l b d -> b l d")  # (B, L, D)
+        q = self.to_q[0](x)
         
-        if context is not None:
-            context = rearrange(context, "m b d -> b m d")  # (B, M, D)
-            k_input = v_input = context
-            # Cross-attention: use 2-layer structure
-            q = self.attn['to_q'][1](self.attn['to_q'][0](x_seq)).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            k = self.attn['to_k'][1](self.attn['to_k'][0](k_input)).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            v = self.attn['to_v'][0](v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        else:
-            k_input = v_input = x_seq
-            # Self-attention: use 1-layer structure
-            q = self.attn['to_q'][0](x_seq).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            k = self.attn['to_k'][0](k_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-            v = self.attn['to_v'][0](v_input).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        context = context if context is not None else x
+        k = self.to_k[0](context)
+        v = self.to_v[0](context)
+        
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
+        
+        if rope_emb_L_1_1_D is not None:
+            q, k = apply_rotary_pos_emb(q, k, rope_emb_L_1_1_D)
             
-        # Apply RoPE if provided
-        if rope_emb_L_1_1_D is not None and context is None:  # Only for self-attention
-            rope_emb = rope_emb_L_1_1_D.squeeze(1).squeeze(1)  # (L, D)
-            rope_emb = rope_emb[:q.shape[2]]  # Match sequence length
-            q, k = apply_rotary_pos_emb(q, k, rope_emb)
-            
-        # Standard attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        sim = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
         
         if crossattn_mask is not None:
-            attn = attn.masked_fill(crossattn_mask.unsqueeze(1).unsqueeze(1), float('-inf'))
+            mask = crossattn_mask.unsqueeze(1).unsqueeze(2)
+            sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
             
-        attn = attn.softmax(dim=-1)
-        out = attn @ v
+        attn = sim.softmax(dim=-1)
         
-        out = out.transpose(1, 2).reshape(B, -1, D)
-        out = self.attn['to_out'][0](out)
-        
-        # Convert back to official format
-        out = rearrange(out, "b (t h w) d -> t h w b d", t=T, h=H, w=W)
-        return out
+        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out[0](out)
 
 
 class OfficialGPT2FeedForward(nn.Module):
@@ -266,30 +272,25 @@ class OfficialGPT2FeedForward(nn.Module):
     
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0, bias: bool = False):
         super().__init__()
-        self.layer1 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.layer2 = nn.Linear(hidden_dim, dim, bias=bias)
-        self.activation = nn.GELU()
+        self.c_fc = nn.Linear(dim, hidden_dim, bias=bias)
+        self.c_proj = nn.Linear(hidden_dim, dim, bias=bias)
+        self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        """x: (T, H, W, B, D) - official format"""
-        original_shape = x.shape
-        x = rearrange(x, "t h w b d -> (t h w b) d")
-        
-        x = self.layer1(x)
-        x = self.activation(x)
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
         x = self.dropout(x)
-        x = self.layer2(x)
-        x = self.dropout(x)
-        
-        x = x.reshape(original_shape)
         return x
 
 
 def adaln_norm_state(norm_state, x, scale, shift):
     """Official adaln_norm_state function from blocks.py"""
     normalized = norm_state(x)
-    return normalized * (1 + scale) + shift
+    # x is (B, N, D), scale/shift are (B, D)
+    # We need to unsqueeze scale/shift to (B, 1, D) for broadcasting
+    return normalized * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class OfficialDITBuildingBlock(nn.Module):
@@ -308,84 +309,45 @@ class OfficialDITBuildingBlock(nn.Module):
         adaln_lora_dim: int = 256,
     ):
         super().__init__()
-        block_type = block_type.lower()
-        
         self.block_type = block_type
-        self.use_adaln_lora = use_adaln_lora
+        self.norm1 = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         
-        # Create the actual block
-        if block_type in ["cross_attn", "ca"]:
-            self.block = OfficialVideoAttn(x_dim, context_dim, num_heads, bias=bias)
-        elif block_type in ["full_attn", "fa"]:
-            self.block = OfficialVideoAttn(x_dim, None, num_heads, bias=bias)
-        elif block_type in ["mlp", "ff"]:
-            self.block = OfficialGPT2FeedForward(x_dim, int(x_dim * mlp_ratio), dropout=mlp_dropout, bias=bias)
+        if block_type == "FA":
+            self.block = OfficialVideoAttn(x_dim, context_dim=None, num_heads=num_heads, bias=bias)
+        elif block_type == "CA":
+            self.block = OfficialVideoAttn(x_dim, context_dim=context_dim, num_heads=num_heads, bias=bias)
+        elif block_type == "MLP":
+            hidden_dim = int(x_dim * mlp_ratio)
+            self.block = OfficialGPT2FeedForward(x_dim, hidden_dim, dropout=mlp_dropout, bias=bias)
         else:
             raise ValueError(f"Unknown block type: {block_type}")
             
-        # AdaLN components
-        self.norm_state = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
-        self.n_adaln_chunks = 3
-        
-        if use_adaln_lora:
-            self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, self.n_adaln_chunks * x_dim, bias=False),
-            )
-        else:
-            self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(), 
-                nn.Linear(x_dim, self.n_adaln_chunks * x_dim, bias=False)
-            )
-    
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(x_dim, 2 * x_dim, bias=True)
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         emb_B_D: torch.Tensor,
+        gate: torch.Tensor,
         crossattn_emb: torch.Tensor,
         crossattn_mask: Optional[torch.Tensor] = None,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
     ):
-        """
-        x: (T, H, W, B, D) - official format
-        emb_B_D: (B, D) - timestep embedding
-        crossattn_emb: (M, B, D) - cross attention context
-        """
-        # AdaLN modulation
-        if self.use_adaln_lora and adaln_lora_B_3D is not None:
-            shift_B_D, scale_B_D, gate_B_D = (self.adaLN_modulation(emb_B_D) + adaln_lora_B_3D).chunk(
-                self.n_adaln_chunks, dim=1
-            )
-        else:
-            shift_B_D, scale_B_D, gate_B_D = self.adaLN_modulation(emb_B_D).chunk(self.n_adaln_chunks, dim=1)
-
-        # Expand to match x dimensions: (T, H, W, B, D)
-        shift_1_1_1_B_D = shift_B_D.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        scale_1_1_1_B_D = scale_B_D.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        gate_1_1_1_B_D = gate_B_D.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-
-        # Apply block with adaptive normalization
-        if self.block_type in ["mlp", "ff"]:
-            x = x + gate_1_1_1_B_D * self.block(
-                adaln_norm_state(self.norm_state, x, scale_1_1_1_B_D, shift_1_1_1_B_D)
-            )
-        elif self.block_type in ["full_attn", "fa"]:
-            x = x + gate_1_1_1_B_D * self.block(
-                adaln_norm_state(self.norm_state, x, scale_1_1_1_B_D, shift_1_1_1_B_D),
-                context=None,
-                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
-            )
-        elif self.block_type in ["cross_attn", "ca"]:
-            x = x + gate_1_1_1_B_D * self.block(
-                adaln_norm_state(self.norm_state, x, scale_1_1_1_B_D, shift_1_1_1_B_D),
-                context=crossattn_emb,
-                crossattn_mask=crossattn_mask,
-                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
-            )
+        shift, scale = self.adaLN_modulation(emb_B_D).chunk(2, dim=1)
+        x_norm = adaln_norm_state(self.norm1, x, scale, shift)
         
-        return x
+        if self.block_type == "FA":
+            x_out = self.block(x_norm, rope_emb_L_1_1_D=rope_emb_L_1_1_D)
+        elif self.block_type == "CA":
+            x_out = self.block(x_norm, context=crossattn_emb, crossattn_mask=crossattn_mask)
+        elif self.block_type == "MLP":
+            x_out = self.block(x_norm)
+            
+        return x + gate.unsqueeze(1) * x_out
 
 
 class OfficialGeneralDITTransformerBlock(nn.Module):
@@ -406,40 +368,28 @@ class OfficialGeneralDITTransformerBlock(nn.Module):
         
         # Parse block config: "ca-fa-mlp" -> ["ca", "fa", "mlp"]
         for block_type in block_config.split("-"):
-            self.blocks.append(
-                OfficialDITBuildingBlock(
-                    block_type,
-                    x_dim,
-                    context_dim,
-                    num_heads,
-                    mlp_ratio,
-                    use_adaln_lora=use_adaln_lora,
-                    adaln_lora_dim=adaln_lora_dim,
-                )
-            )
+            block_type = block_type.strip().upper()
+            if block_type == "FA":
+                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
+            elif block_type == "CA":
+                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=context_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
+            elif block_type == "MLP":
+                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
+            else:
+                raise ValueError(f"Unknown block type: {block_type}")
 
     def forward(
         self,
         x: torch.Tensor,
         emb_B_D: torch.Tensor,
+        gate: torch.Tensor,
         crossattn_emb: torch.Tensor,
         crossattn_mask: Optional[torch.Tensor] = None,
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
-        extra_per_block_pos_emb: Optional[torch.Tensor] = None,
     ):
-        if extra_per_block_pos_emb is not None:
-            x = x + extra_per_block_pos_emb
-            
         for block in self.blocks:
-            x = block(
-                x,
-                emb_B_D,
-                crossattn_emb,
-                crossattn_mask,
-                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
-                adaln_lora_B_3D=adaln_lora_B_3D,
-            )
+            x = block(x, emb_B_D, gate, crossattn_emb, crossattn_mask, rope_emb_L_1_1_D=rope_emb_L_1_1_D, adaln_lora_B_3D=adaln_lora_B_3D)
         return x
 
 
@@ -458,47 +408,27 @@ class OfficialFinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
-            hidden_size, spatial_patch_size * spatial_patch_size * temporal_patch_size * out_channels, bias=False
+            hidden_size, spatial_patch_size * spatial_patch_size * temporal_patch_size * out_channels, bias=True
         )
         self.hidden_size = hidden_size
         self.n_adaln_chunks = 2
         self.use_adaln_lora = use_adaln_lora
         
-        if use_adaln_lora:
-            self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(hidden_size, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, self.n_adaln_chunks * hidden_size, bias=False),
-            )
-        else:
-            self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(), nn.Linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=False)
-            )
+        # Official implementation uses bias=True here
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=True)
+        )
 
     def forward(
         self,
-        x_BT_HW_D,
+        x,
         emb_B_D,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
     ):
-        if self.use_adaln_lora and adaln_lora_B_3D is not None:
-            shift_B_D, scale_B_D = (self.adaLN_modulation(emb_B_D) + adaln_lora_B_3D[:, : 2 * self.hidden_size]).chunk(
-                2, dim=1
-            )
-        else:
-            shift_B_D, scale_B_D = self.adaLN_modulation(emb_B_D).chunk(2, dim=1)
-
-        B = emb_B_D.shape[0]
-        T = x_BT_HW_D.shape[0] // B
-        
-        shift_BT_D, scale_BT_D = repeat(shift_B_D, "b d -> (b t) d", t=T), repeat(scale_B_D, "b d -> (b t) d", t=T)
-        
-        def modulate(x, shift, scale):
-            return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-            
-        x_BT_HW_D = modulate(self.norm_final(x_BT_HW_D), shift_BT_D, scale_BT_D)
-        x_BT_HW_D = self.linear(x_BT_HW_D)
-        return x_BT_HW_D
+        shift, scale = self.adaLN_modulation(emb_B_D).chunk(2, dim=1)
+        x = adaln_norm_state(self.norm_final, x, scale, shift)
+        x = self.linear(x)
+        return x
 
 
 class CleanGeneralDIT(nn.Module):
@@ -544,105 +474,77 @@ class CleanGeneralDIT(nn.Module):
         **kwargs
     ):
         super().__init__()
-        
-        self.max_img_h = max_img_h
-        self.max_img_w = max_img_w
-        self.max_frames = max_frames
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.patch_spatial = patch_spatial
         self.patch_temporal = patch_temporal
-        self.model_channels = model_channels
         self.num_heads = num_heads
-        self.num_blocks = num_blocks
-        self.concat_padding_mask = concat_padding_mask
+        self.model_channels = model_channels
         self.use_cross_attn_mask = use_cross_attn_mask
-        self.crossattn_emb_channels = crossattn_emb_channels
+        self.concat_padding_mask = concat_padding_mask
+        self.pos_emb_cls = pos_emb_cls
         self.use_adaln_lora = use_adaln_lora
         self.adaln_lora_dim = adaln_lora_dim
+        self.affline_emb_norm = affline_emb_norm
         
-        # Build components
         self._build_patch_embed()
         self._build_time_embed()
         self._build_pos_embed()
-        self._build_blocks()
+        self._build_blocks(num_blocks, block_config, mlp_ratio, crossattn_emb_channels)
         self._build_final_layer()
         
-        # Normalization - add bias=True to match checkpoint
-        if affline_emb_norm:
-            self.affline_norm = nn.LayerNorm(model_channels, bias=True)
-        else:
-            self.affline_norm = nn.Identity()
-            
         self.initialize_weights()
-        
+
     def _build_patch_embed(self):
-        """Build patch embedding layer"""
-        in_ch = self.in_channels
+        in_channels = self.in_channels
         if self.concat_padding_mask:
-            in_ch += 1
-            
+            in_channels += 1
         self.x_embedder = CleanPatchEmbed(
-            spatial_patch_size=self.patch_spatial,
-            temporal_patch_size=self.patch_temporal,
-            in_channels=in_ch,
-            out_channels=self.model_channels,
-            bias=False
+            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=True
         )
         
     def _build_time_embed(self):
-        """Build timestep embedding"""
         self.t_embedder = nn.Sequential(
             CleanTimesteps(self.model_channels),
-            CleanTimestepEmbedding(self.model_channels, self.model_channels, use_adaln_lora=self.use_adaln_lora)
+            CleanTimestepEmbedding(self.model_channels, self.model_channels, use_adaln_lora=self.use_adaln_lora),
         )
         
     def _build_pos_embed(self):
-        """Build position embedding to match checkpoint naming exactly"""
-        if hasattr(self, 'pos_emb_cls') and self.pos_emb_cls == "rope3d":
-            head_dim = self.model_channels // self.num_heads
-            self.rope_handler = CleanRoPE3D(
-                head_dim=head_dim,
-                max_t=self.max_frames // self.patch_temporal,
-                max_h=self.max_img_h // self.patch_spatial,
-                max_w=self.max_img_w // self.patch_spatial
-            )
-        else:
-            self.rope_handler = None
+        self.pos_embedder = CleanRoPE3D(
+            head_dim=self.model_channels // self.num_heads,
+            max_t=128, max_h=240, max_w=240
+        )
             
-        # Create pos_embedder with seq parameter to match checkpoint: net.pos_embedder.seq
-        # Checkpoint expects small size (128,) not massive (1843200, 4096)
-        # This is likely for RoPE frequency parameters, not full sequence embedding
-        self.pos_embedder = nn.Module()
-        self.pos_embedder.seq = nn.Parameter(torch.randn(128) * 0.02)  # Match checkpoint shape
-            
-    def _build_blocks(self):
-        """Build transformer blocks using official structure"""
-        self.blocks = nn.ModuleDict()
-        for i in range(self.num_blocks):
-            self.blocks[f"block{i}"] = OfficialGeneralDITTransformerBlock(
-                x_dim=self.model_channels,
-                context_dim=self.crossattn_emb_channels,
-                num_heads=self.num_heads,
-                block_config="ca-fa-mlp",  # Official config
-                mlp_ratio=4.0,
-                use_adaln_lora=self.use_adaln_lora,
-                adaln_lora_dim=self.adaln_lora_dim,
+    def _build_blocks(self, num_blocks, block_config, mlp_ratio, crossattn_emb_channels):
+        self.blocks = nn.ModuleList()
+        for _ in range(num_blocks):
+            self.blocks.append(
+                OfficialGeneralDITTransformerBlock(
+                    self.model_channels,
+                    crossattn_emb_channels,
+                    self.num_heads,
+                    block_config,
+                    mlp_ratio,
+                    self.use_adaln_lora,
+                    self.adaln_lora_dim,
+                )
             )
             
     def _build_final_layer(self):
-        """Build final output layer using official structure"""
         self.final_layer = OfficialFinalLayer(
-            hidden_size=self.model_channels,
-            spatial_patch_size=self.patch_spatial,
-            temporal_patch_size=self.patch_temporal,
-            out_channels=self.out_channels,
-            use_adaln_lora=self.use_adaln_lora,
-            adaln_lora_dim=self.adaln_lora_dim
+            self.model_channels,
+            self.patch_spatial,
+            self.patch_temporal,
+            self.out_channels,
+            self.use_adaln_lora,
+            self.adaln_lora_dim,
         )
+        if self.affline_emb_norm:
+            self.affline_norm = nn.LayerNorm(self.model_channels, bias=True)
+        else:
+            self.affline_norm = nn.Identity()
         
     def initialize_weights(self):
-        """Initialize model weights to match official implementation"""
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
@@ -653,54 +555,30 @@ class CleanGeneralDIT(nn.Module):
         
         # Initialize timestep embedding
         nn.init.normal_(self.t_embedder[1].linear_1.weight, std=0.02)
+        nn.init.constant_(self.t_embedder[1].linear_1.bias, 0)
         nn.init.normal_(self.t_embedder[1].linear_2.weight, std=0.02)
+        nn.init.constant_(self.t_embedder[1].linear_2.bias, 0)
         
-        # Zero-out adaLN modulation layers in official blocks
-        for block_wrapper in self.blocks.values():
-            for building_block in block_wrapper.blocks:
-                # Zero initialize the final layer of adaLN_modulation
-                if hasattr(building_block, 'adaLN_modulation'):
-                    if len(building_block.adaLN_modulation) > 1:
-                        nn.init.constant_(building_block.adaLN_modulation[-1].weight, 0)
-                        if building_block.adaLN_modulation[-1].bias is not None:
-                            nn.init.constant_(building_block.adaLN_modulation[-1].bias, 0)
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            for sub_block in block.blocks:
+                nn.init.constant_(sub_block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(sub_block.adaLN_modulation[-1].bias, 0)
             
     def prepare_inputs(self, x, timesteps, crossattn_emb, padding_mask=None, latent_condition=None):
-        """Prepare inputs for the forward pass with official tensor format conversion"""
-        B, C, T, H, W = x.shape
-        
-        # Handle latent conditions by concatenating
-        if latent_condition is not None:
-            x = torch.cat([x, latent_condition], dim=1)
-            
-        # Add padding mask if needed
         if self.concat_padding_mask and padding_mask is not None:
-            x = torch.cat([x, padding_mask], dim=1)
+            x = torch.cat([x, padding_mask.unsqueeze(1).repeat(1, 1, x.shape[2], 1, 1)], dim=1)
             
-        # Patch embedding
-        x = self.x_embedder(x)  # (B, T', H', W', D)
-        B, T_p, H_p, W_p, D = x.shape
+        x = self.x_embedder(x)
         
-        # Convert to official format: (B, T', H', W', D) -> (T', H', W', B, D)
-        x = rearrange(x, "b t h w d -> t h w b d")
+        # t_embedder returns a tuple (embedding, lora_embedding)
+        emb, adaln_lora = self.t_embedder(timesteps)
         
-        # Time embedding  
-        timestep_emb = self.t_embedder(timesteps)  # (B, D*3) -> extract first D for embeddings
-        if timestep_emb.shape[1] > self.model_channels:
-            timestep_emb = timestep_emb[:, :self.model_channels]  # Use first part for basic embedding
-        timestep_emb = self.affline_norm(timestep_emb)
-        
-        # Convert crossattn_emb to official format if provided
-        if crossattn_emb is not None:
-            crossattn_emb = rearrange(crossattn_emb, "b s d -> s b d")  # (B, S, D) -> (S, B, D)
-        
-        # Position embedding for RoPE
         rope_emb = None
-        if self.rope_handler is not None:
-            rope_emb_3d = self.rope_handler.get_rope_embeddings(T_p, H_p, W_p, x.device)
-            rope_emb = rearrange(rope_emb_3d, "t h w d -> (t h w) 1 1 d")  # (L, 1, 1, D)
+        if self.pos_embedder is not None:
+            rope_emb = self.pos_embedder(shape=(x.shape[1], x.shape[2], x.shape[3]))
             
-        return x, timestep_emb, crossattn_emb, rope_emb, (B, C, T, H, W), (T_p, H_p, W_p)
+        return x, emb, adaln_lora, rope_emb
         
     def forward(
         self,
@@ -711,67 +589,40 @@ class CleanGeneralDIT(nn.Module):
         padding_mask=None,
         latent_condition=None,
         scalar_feature=None,
-
         **kwargs
     ) -> torch.Tensor:
-        """
-        Forward pass of the DiT model.
+        x, emb, adaln_lora, rope_emb = self.prepare_inputs(x, timesteps, crossattn_emb, padding_mask, latent_condition)
         
-        Args:
-            x: Input tensor (B, C, T, H, W)
-            timesteps: Timestep tensor (B,) 
-            crossattn_emb: Cross attention embeddings (B, S, D)
-            crossattn_mask: Cross attention mask (B, S)
-            padding_mask: Padding mask (B, 1, T, H, W)
-            latent_condition: Additional conditioning (B, C_cond, T, H, W)
+        # Split the 3*D embedding into the main embedding, and two gates
+        ada_emb, gate1, gate2 = emb.chunk(3, dim=1)
+        
+        B, T, H, W, D = x.shape
+        # Flatten spatial and temporal dimensions into a single sequence dimension
+        x = rearrange(x, 'b t h w d -> b (t h w) d')
+        
+        # Apply first gate
+        x = x * gate1.unsqueeze(1)
+        
+        for block in self.blocks:
+            x = block(
+                x, 
+                ada_emb, 
+                gate2, # Use the second gate for the residual connections in the blocks
+                crossattn_emb, 
+                crossattn_mask, 
+                rope_emb_L_1_1_D=rope_emb, 
+                adaln_lora_B_3D=adaln_lora
+            )
             
-        Returns:
-            Output tensor (B, C_out, T, H, W)
-        """
-        print(f"[DIT] Input x shape: {x.shape} (expected 5D: B,C,T,H,W)")
-        print(f"[DIT] timesteps shape: {timesteps.shape}")
-        if crossattn_emb is not None:
-            print(f"[DIT] crossattn_emb shape: {crossattn_emb.shape}")
+        # The final layer uses the main embedding to compute its shift and scale
+        x = self.final_layer(x, ada_emb, adaln_lora_B_3D=adaln_lora)
         
-        # Prepare inputs
-        x, timestep_emb, crossattn_emb, rope_emb, orig_shape, patch_shape = self.prepare_inputs(
-            x, timesteps, crossattn_emb, padding_mask, latent_condition
-        )
-        print(f"[DIT] After prepare_inputs, x shape: {x.shape}")
-        print(f"[DIT] orig_shape: {orig_shape}, patch_shape: {patch_shape}")
+        # Unpatchify the output
+        output = rearrange(x, 'b (t h w) (p1 p2 pt c) -> b c (t pt) (h p1) (w p2)',
+                         p1=self.patch_spatial, p2=self.patch_spatial, pt=self.patch_temporal,
+                         c=self.out_channels, t=T, h=H, w=W)
         
-        # Process cross attention mask
-        if self.use_cross_attn_mask and crossattn_mask is not None:
-            crossattn_mask = crossattn_mask[:, None, None, :]  # (B, 1, 1, S)
-        else:
-            crossattn_mask = None
-            
-        # Apply transformer blocks with official format
-        for i, block in enumerate(self.blocks.values()):
-            x = block(x, timestep_emb, crossattn_emb, crossattn_mask, rope_emb)
-            if i == 0:  # Log first block output
-                print(f"[DIT] After block {i}, x shape: {x.shape} (official format: T,H,W,B,D)")
-        
-        # Convert back to batch-first for final layer: (T,H,W,B,D) -> (B*T*H*W, D)
-        T_p, H_p, W_p, B, D = x.shape
-        x = rearrange(x, "t h w b d -> (b t h w) d")
-        
-        # Final layer
-        x = self.final_layer(x, timestep_emb)
-        print(f"[DIT] After final_layer, x shape: {x.shape}")
-        
-        # Reshape back to video format
-        B, C_orig, T_orig, H_orig, W_orig = orig_shape
-        
-        x = rearrange(
-            x, 
-            "(b t h w) (p1 p2 pt c) -> b c (t pt) (h p1) (w p2)",
-            b=B, t=T_p, h=H_p, w=W_p,
-            p1=self.patch_spatial, p2=self.patch_spatial, pt=self.patch_temporal, c=self.out_channels
-        )
-        print(f"[DIT] Final output shape: {x.shape} (expected 5D: B,C,T,H,W)")
-        
-        return x
+        return output
 
     def load_checkpoint(self, checkpoint_path: str, strict: bool = False):
         """
@@ -830,29 +681,53 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
     
     def __init__(
         self,
-        additional_concat_ch: int = 0,
+        additional_concat_ch: int = 16,
         use_context_embedding: bool = True,
         **kwargs
     ):
         self.additional_concat_ch = additional_concat_ch
         self.use_context_embedding = use_context_embedding
+        super().__init__(**kwargs)
+
+    def _build_patch_embed(self):
+        """
+        Override to adjust input channels for latent_condition.
+        """
+        in_channels = self.in_channels + self.additional_concat_ch
+        if self.concat_padding_mask:
+            in_channels += 1
         
-        # Adjust input channels for additional conditioning
-        if 'in_channels' in kwargs:
-            kwargs['in_channels'] += additional_concat_ch
+        self.x_embedder = CleanPatchEmbed(
+            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=True
+        )
+
+    def prepare_inputs(self, x, timesteps, crossattn_emb, padding_mask=None, latent_condition=None):
+        """
+        Override to concatenate latent_condition to the input tensor.
+        """
+        if latent_condition is not None:
+            x = torch.cat([x, latent_condition], dim=1)
+
+        if self.concat_padding_mask and padding_mask is not None:
+            x = torch.cat([x, padding_mask.unsqueeze(1).repeat(1, 1, x.shape[2], 1, 1)], dim=1)
             
+        x = self.x_embedder(x)
+        
+        # t_embedder returns a tuple (embedding, lora_embedding)
+        emb, adaln_lora = self.t_embedder(timesteps)
+        
+        rope_emb = None
+        if self.pos_embedder is not None:
+            rope_emb = self.pos_embedder(shape=(x.shape[1], x.shape[2], x.shape[3]))
+            
+        return x, emb, adaln_lora, rope_emb
+        self.additional_concat_ch = additional_concat_ch
+        self.use_context_embedding = use_context_embedding
         super().__init__(**kwargs)
         
-        # Context embedding for inverse renderer - CRITICAL: Use 1024 not 4096!
         if self.use_context_embedding:
-            self.context_embedding = nn.Embedding(
-                num_embeddings=16,  # For different G-buffer types
-                embedding_dim=1024  # FIXED: Official checkpoint expects 1024, not 4096!
-            )
-            # Initialize context embeddings
-            with torch.no_grad():
-                nn.init.uniform_(self.context_embedding.weight, -0.3, 0.3)
-                
+            self.context_embedding = nn.Embedding(16, kwargs["crossattn_emb_channels"])
+            
     def forward(
         self,
         x: torch.Tensor,
@@ -861,25 +736,10 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         context_index: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
-        """
-        Forward pass with context embedding support.
-        
-        Args:
-            x: Input tensor (B, C, T, H, W)
-            timesteps: Timestep tensor (B,)
-            crossattn_emb: Cross attention embeddings (B, S, D) - optional for forward renderer
-            context_index: Context indices for G-buffer type (B, 1) - for inverse renderer
-            **kwargs: Additional arguments
-            
-        Returns:
-            Output tensor (B, C_out, T, H, W)
-        """
-        # Handle context embedding for inverse renderer
         if self.use_context_embedding and context_index is not None:
-            # Get context embeddings for the specified G-buffer type
-            context_emb = self.context_embedding(context_index)  # (B, 1, D)
-            
-            # Overwrite crossattn_emb to match official implementation
+            context_emb = self.context_embedding(context_index.long())
+            if context_emb.ndim == 2:
+                context_emb = context_emb.unsqueeze(1)
             crossattn_emb = context_emb
-                
+            
         return super().forward(x, timesteps, crossattn_emb, **kwargs)
