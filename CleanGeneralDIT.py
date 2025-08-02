@@ -45,8 +45,8 @@ class CleanRoPE3D(nn.Module):
         # This parameter is crucial for loading the official checkpoint
         self.logvar = nn.Parameter(torch.zeros(1))
         
-        # Add seq parameter to match checkpoint structure
-        self.seq = nn.Parameter(torch.zeros(1, 1, head_dim))
+        # Add seq parameter to match checkpoint structure - should be 1D [head_dim]
+        self.seq = nn.Parameter(torch.zeros(head_dim))
         
         # Create sinusoidal embeddings for each dimension
         self.t_freqs = self._create_sinusoidal_embeddings(self.d_t, self.max_t)
@@ -229,7 +229,19 @@ class ProjLayer(nn.Module):
 
 
 class OfficialVideoAttn(nn.Module):
-    """Official VideoAttn implementation matching blocks.py"""
+    """Official VideoAttn implementation matching blocks.py with attn submodule"""
+    
+    def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, bias: bool = True):
+        super().__init__()
+        # Create nested attn module to match checkpoint structure
+        self.attn = OfficialAttention(x_dim, context_dim, num_heads, bias)
+
+    def forward(self, x, context=None, crossattn_mask=None, rope_emb_L_1_1_D=None):
+        return self.attn(x, context, crossattn_mask, rope_emb_L_1_1_D)
+
+
+class OfficialAttention(nn.Module):
+    """Nested attention module with the actual attention layers"""
     
     def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, bias: bool = True):
         super().__init__()
@@ -237,7 +249,7 @@ class OfficialVideoAttn(nn.Module):
         self.head_dim = x_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Wrap linear layers in Sequential to match checkpoint structure
+        # Match checkpoint structure exactly
         self.to_q = nn.Sequential(
             nn.Linear(x_dim, x_dim, bias=False),
             nn.Linear(x_dim, x_dim, bias=bias)
@@ -284,19 +296,20 @@ class OfficialVideoAttn(nn.Module):
 
 
 class OfficialGPT2FeedForward(nn.Module):
-    """Official GPT2FeedForward matching the blocks.py structure"""
+    """Official GPT2FeedForward matching the blocks.py structure with layer1/layer2"""
     
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
-        self.c_fc = nn.Linear(dim, hidden_dim, bias=bias)
+        # Use layer1 and layer2 to match checkpoint structure
+        self.layer1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(hidden_dim, dim, bias=bias)
+        self.layer2 = nn.Linear(hidden_dim, dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        x = self.c_fc(x)
+        x = self.layer1(x)
         x = self.gelu(x)
-        x = self.c_proj(x)
+        x = self.layer2(x)
         x = self.dropout(x)
         return x
 
@@ -338,7 +351,12 @@ class OfficialDITBuildingBlock(nn.Module):
         else:
             raise ValueError(f"Unknown block type: {block_type}")
             
-        self.adaLN_modulation = nn.Linear(x_dim, 2 * x_dim, bias=True)
+        # Use Sequential structure to match checkpoint: adaLN_modulation.1.weight, adaLN_modulation.2.weight
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(x_dim, x_dim, bias=False),
+            nn.Linear(x_dim, 2 * x_dim, bias=True)
+        )
 
     def forward(
         self,
@@ -428,11 +446,18 @@ class OfficialFinalLayer(nn.Module):
         self.n_adaln_chunks = 2
         self.use_adaln_lora = use_adaln_lora
         
-        # Official implementation uses bias=True here
-        # The checkpoint expects adaln_lora_dim output, not 2 * hidden_size
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, adaln_lora_dim, bias=True)
-        )
+        # Match official FinalLayer structure
+        if use_adaln_lora:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, adaln_lora_dim, bias=True),
+                nn.Linear(adaln_lora_dim, self.n_adaln_chunks * hidden_size, bias=True)
+            )
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(), 
+                nn.Linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=True)
+            )
 
     def forward(
         self,
@@ -575,12 +600,21 @@ class CleanGeneralDIT(nn.Module):
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks.values():
             for sub_block in block.blocks:
-                nn.init.constant_(sub_block.adaLN_modulation[-1].weight, 0)
-                nn.init.constant_(sub_block.adaLN_modulation[-1].bias, 0)
+                # Handle both nn.Linear and nn.Sequential cases
+                if isinstance(sub_block.adaLN_modulation, nn.Sequential):
+                    nn.init.constant_(sub_block.adaLN_modulation[-1].weight, 0)
+                    nn.init.constant_(sub_block.adaLN_modulation[-1].bias, 0)
+                else:
+                    nn.init.constant_(sub_block.adaLN_modulation.weight, 0)
+                    nn.init.constant_(sub_block.adaLN_modulation.bias, 0)
 
         # Zero-out final layer
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        if isinstance(self.final_layer.adaLN_modulation, nn.Sequential):
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        else:
+            nn.init.constant_(self.final_layer.adaLN_modulation.weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation.bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
             
