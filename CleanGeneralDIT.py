@@ -45,6 +45,9 @@ class CleanRoPE3D(nn.Module):
         # This parameter is crucial for loading the official checkpoint
         self.logvar = nn.Parameter(torch.zeros(1))
         
+        # Add seq parameter to match checkpoint structure
+        self.seq = nn.Parameter(torch.zeros(1, 1, head_dim))
+        
         # Create sinusoidal embeddings for each dimension
         self.t_freqs = self._create_sinusoidal_embeddings(self.d_t, self.max_t)
         self.h_freqs = self._create_sinusoidal_embeddings(self.d_h, self.max_h)
@@ -187,7 +190,7 @@ class CleanPatchEmbed(nn.Module):
             nn.Linear(
                 in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size, 
                 out_channels, 
-                bias=bias
+                bias=True
             )
         )
         self.out = nn.Identity()
@@ -228,19 +231,30 @@ class ProjLayer(nn.Module):
 class OfficialVideoAttn(nn.Module):
     """Official VideoAttn implementation matching blocks.py"""
     
-    def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, bias: bool = False):
+    def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, bias: bool = True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = x_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        self.to_q = nn.Linear(x_dim, x_dim, bias=bias)
+        # Wrap linear layers in Sequential to match checkpoint structure
+        self.to_q = nn.Sequential(
+            nn.Linear(x_dim, x_dim, bias=False),
+            nn.Linear(x_dim, x_dim, bias=bias)
+        )
         
         kv_dim = context_dim if context_dim is not None else x_dim
-        self.to_k = nn.Linear(kv_dim, x_dim, bias=bias)
-        self.to_v = nn.Linear(kv_dim, x_dim, bias=bias)
+        self.to_k = nn.Sequential(
+            nn.Linear(kv_dim, x_dim, bias=False),
+            nn.Linear(x_dim, x_dim, bias=bias)
+        )
+        self.to_v = nn.Sequential(
+            nn.Linear(kv_dim, x_dim, bias=False)
+        )
         
-        self.to_out = nn.Linear(x_dim, x_dim, bias=bias)
+        self.to_out = nn.Sequential(
+            nn.Linear(x_dim, x_dim, bias=bias)
+        )
 
     def forward(self, x, context=None, crossattn_mask=None, rope_emb_L_1_1_D=None):
         h = self.num_heads
@@ -272,11 +286,11 @@ class OfficialVideoAttn(nn.Module):
 class OfficialGPT2FeedForward(nn.Module):
     """Official GPT2FeedForward matching the blocks.py structure"""
     
-    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0, bias: bool = False):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
         self.c_fc = nn.Linear(dim, hidden_dim, bias=bias)
-        self.c_proj = nn.Linear(hidden_dim, dim, bias=bias)
         self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(hidden_dim, dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
@@ -324,10 +338,7 @@ class OfficialDITBuildingBlock(nn.Module):
         else:
             raise ValueError(f"Unknown block type: {block_type}")
             
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(x_dim, 2 * x_dim, bias=True)
-        )
+        self.adaLN_modulation = nn.Linear(x_dim, 2 * x_dim, bias=True)
 
     def forward(
         self,
@@ -360,24 +371,24 @@ class OfficialGeneralDITTransformerBlock(nn.Module):
         x_dim: int,
         context_dim: int,
         num_heads: int,
-        block_config: str = "ca-fa-mlp",
+        block_config: str = "FA-CA-MLP",
         mlp_ratio: float = 4.0,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
     ):
         super().__init__()
-        self.blocks = nn.ModuleDict()
+        # Use ModuleList for numeric indexing to match checkpoint
+        self.blocks = nn.ModuleList()
         
-        # Parse block config: "ca-fa-mlp" -> ["ca", "fa", "mlp"]
+        # Parse block config: "FA-CA-MLP" -> ["FA", "CA", "MLP"]
         for block_type in block_config.split("-"):
-            block_type_key = block_type.strip().lower()
             block_type = block_type.strip().upper()
             if block_type == "FA":
-                self.blocks[block_type_key] = OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim)
+                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
             elif block_type == "CA":
-                self.blocks[block_type_key] = OfficialDITBuildingBlock(block_type, x_dim, context_dim=context_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim)
+                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=context_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
             elif block_type == "MLP":
-                self.blocks[block_type_key] = OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim)
+                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
             else:
                 raise ValueError(f"Unknown block type: {block_type}")
 
@@ -418,8 +429,9 @@ class OfficialFinalLayer(nn.Module):
         self.use_adaln_lora = use_adaln_lora
         
         # Official implementation uses bias=True here
+        # The checkpoint expects adaln_lora_dim output, not 2 * hidden_size
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=True)
+            nn.SiLU(), nn.Linear(hidden_size, adaln_lora_dim, bias=True)
         )
 
     def forward(
@@ -561,7 +573,7 @@ class CleanGeneralDIT(nn.Module):
         nn.init.constant_(self.t_embedder[1].linear_2.bias, 0)
         
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
+        for block in self.blocks.values():
             for sub_block in block.blocks:
                 nn.init.constant_(sub_block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(sub_block.adaLN_modulation[-1].bias, 0)
@@ -610,7 +622,7 @@ class CleanGeneralDIT(nn.Module):
         # Apply first gate
         x = x * gate1.unsqueeze(1)
         
-        for block in self.blocks:
+        for block in self.blocks.values():
             x = block(
                 x, 
                 ada_emb, 
