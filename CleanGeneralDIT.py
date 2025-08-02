@@ -176,19 +176,16 @@ class CleanPatchEmbed(nn.Module):
         self.spatial_patch_size = spatial_patch_size
         self.temporal_patch_size = temporal_patch_size
         
-        # Official structure: sequential with Rearrange + Linear to match proj.1.weight
-        self.proj = nn.Sequential(
-            Rearrange(
-                "b c (t r) (h m) (w n) -> b t h w (c r m n)",
-                r=temporal_patch_size,
-                m=spatial_patch_size,
-                n=spatial_patch_size,
-            ),
-            nn.Linear(
-                in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size, 
-                out_channels, 
-                bias=bias
-            ),
+        self.rearrange = Rearrange(
+            "b c (t r) (h m) (w n) -> b t h w (c r m n)",
+            r=temporal_patch_size,
+            m=spatial_patch_size,
+            n=spatial_patch_size,
+        )
+        self.proj = nn.Linear(
+            in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size, 
+            out_channels, 
+            bias=bias
         )
         self.out = nn.Identity()
         
@@ -201,6 +198,7 @@ class CleanPatchEmbed(nn.Module):
         _, _, T, H, W = x.shape
         assert H % self.spatial_patch_size == 0 and W % self.spatial_patch_size == 0
         assert T % self.temporal_patch_size == 0
+        x = self.rearrange(x)
         x = self.proj(x)
         return self.out(x)
 
@@ -215,6 +213,15 @@ class DummyWeight(nn.Module):
         return x
 
 
+class ProjLayer(nn.Module):
+    """A helper module for projection layers."""
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.proj = nn.Linear(in_features, out_features, bias=bias)
+    def forward(self, x):
+        return self.proj(x)
+
+
 class OfficialVideoAttn(nn.Module):
     """Official VideoAttn implementation matching blocks.py"""
     
@@ -224,30 +231,22 @@ class OfficialVideoAttn(nn.Module):
         self.head_dim = x_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Use Sequential to get the .0.weight keys
-        self.to_q = nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
+        self.to_q = nn.Linear(x_dim, x_dim, bias=bias)
         
         kv_dim = context_dim if context_dim is not None else x_dim
-        self.to_k = nn.Sequential(nn.Linear(kv_dim, x_dim, bias=bias))
-        self.to_v = nn.Sequential(nn.Linear(kv_dim, x_dim, bias=bias))
+        self.to_k = nn.Linear(kv_dim, x_dim, bias=bias)
+        self.to_v = nn.Linear(kv_dim, x_dim, bias=bias)
         
-        self.to_out = nn.Sequential(nn.Linear(x_dim, x_dim, bias=bias))
-
-        # Add dummy weights for self-attention to match checkpoint keys
-        if context_dim is None:
-            self.to_q.add_module("1", DummyWeight(128))
-            self.to_k.add_module("1", DummyWeight(128))
-            self.to_v.add_module("1", DummyWeight(128))
-            self.to_out.add_module("1", DummyWeight(128))
+        self.to_out = nn.Linear(x_dim, x_dim, bias=bias)
 
     def forward(self, x, context=None, crossattn_mask=None, rope_emb_L_1_1_D=None):
         h = self.num_heads
         
-        q = self.to_q[0](x)
+        q = self.to_q(x)
         
         context = context if context is not None else x
-        k = self.to_k[0](context)
-        v = self.to_v[0](context)
+        k = self.to_k(context)
+        v = self.to_v(context)
         
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
         
@@ -264,7 +263,7 @@ class OfficialVideoAttn(nn.Module):
         
         out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out[0](out)
+        return self.to_out(out)
 
 
 class OfficialGPT2FeedForward(nn.Module):
@@ -500,7 +499,7 @@ class CleanGeneralDIT(nn.Module):
         if self.concat_padding_mask:
             in_channels += 1
         self.x_embedder = CleanPatchEmbed(
-            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=True
+            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=False
         )
         
     def _build_time_embed(self):
@@ -564,6 +563,12 @@ class CleanGeneralDIT(nn.Module):
             for sub_block in block.blocks:
                 nn.init.constant_(sub_block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(sub_block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out final layer
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
             
     def prepare_inputs(self, x, timesteps, crossattn_emb, padding_mask=None, latent_condition=None):
         if self.concat_padding_mask and padding_mask is not None:
@@ -704,13 +709,13 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         """
         in_channels = self.in_channels
         if self.additional_concat_ch is not None:
-             in_channels += self.additional_concat_ch
+            in_channels += self.additional_concat_ch
         
         if self.concat_padding_mask:
             in_channels += 1
         
         self.x_embedder = CleanPatchEmbed(
-            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=False
+            self.patch_spatial, self.patch_temporal, in_channels, self.model_channels, bias=True
         )
 
     def prepare_inputs(self, x, timesteps, crossattn_emb, padding_mask=None, latent_condition=None):
