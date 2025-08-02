@@ -182,10 +182,13 @@ class CleanPatchEmbed(nn.Module):
             m=spatial_patch_size,
             n=spatial_patch_size,
         )
-        self.proj = nn.Linear(
-            in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size, 
-            out_channels, 
-            bias=bias
+        self.proj = nn.Sequential(
+            nn.Identity(),
+            nn.Linear(
+                in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size, 
+                out_channels, 
+                bias=bias
+            )
         )
         self.out = nn.Identity()
         
@@ -363,17 +366,18 @@ class OfficialGeneralDITTransformerBlock(nn.Module):
         adaln_lora_dim: int = 256,
     ):
         super().__init__()
-        self.blocks = nn.ModuleList()
+        self.blocks = nn.ModuleDict()
         
         # Parse block config: "ca-fa-mlp" -> ["ca", "fa", "mlp"]
         for block_type in block_config.split("-"):
+            block_type_key = block_type.strip().lower()
             block_type = block_type.strip().upper()
             if block_type == "FA":
-                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
+                self.blocks[block_type_key] = OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim)
             elif block_type == "CA":
-                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=context_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
+                self.blocks[block_type_key] = OfficialDITBuildingBlock(block_type, x_dim, context_dim=context_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim)
             elif block_type == "MLP":
-                self.blocks.append(OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim))
+                self.blocks[block_type_key] = OfficialDITBuildingBlock(block_type, x_dim, context_dim=None, num_heads=num_heads, mlp_ratio=mlp_ratio, use_adaln_lora=use_adaln_lora, adaln_lora_dim=adaln_lora_dim)
             else:
                 raise ValueError(f"Unknown block type: {block_type}")
 
@@ -515,18 +519,16 @@ class CleanGeneralDIT(nn.Module):
         )
             
     def _build_blocks(self, num_blocks, block_config, mlp_ratio, crossattn_emb_channels):
-        self.blocks = nn.ModuleList()
-        for _ in range(num_blocks):
-            self.blocks.append(
-                OfficialGeneralDITTransformerBlock(
-                    self.model_channels,
-                    crossattn_emb_channels,
-                    self.num_heads,
-                    block_config,
-                    mlp_ratio,
-                    self.use_adaln_lora,
-                    self.adaln_lora_dim,
-                )
+        self.blocks = nn.ModuleDict()
+        for i in range(num_blocks):
+            self.blocks[f"block{i}"] = OfficialGeneralDITTransformerBlock(
+                self.model_channels,
+                crossattn_emb_channels,
+                self.num_heads,
+                block_config,
+                mlp_ratio,
+                self.use_adaln_lora,
+                self.adaln_lora_dim,
             )
             
     def _build_final_layer(self):
