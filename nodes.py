@@ -329,8 +329,9 @@ class Cosmos1InverseRenderer:
             print(f"[Nodes] Prepared image_tensor for pipeline: {image_tensor.shape} (expected: 1,T,C,H,W)")
 
             data_batch = {
-                "image": image_tensor,
-                "context_index": torch.zeros(1, 1, dtype=torch.long),  # Controls which G-buffer to generate
+                "rgb": image_tensor,
+                "video": image_tensor, # Add this so the pipeline can find a tensor for shape inference
+                "context_index": torch.zeros(1, 1, dtype=torch.long),
             }
 
             for gbuffer_pass in inference_passes:

@@ -249,21 +249,19 @@ class CleanDiffusionRendererPipeline:
         data_batch = self._move_to_device(data_batch)
         
         # 2. Find video tensor and infer dimensions
-        video_tensor = None
-        if 'video' in data_batch:
-            video_tensor = data_batch['video']
-        else:
-            # Find the first available tensor to infer dimensions
-            for attributes in ['rgb', 'basecolor', 'normal', 'depth', 'roughness', 'metallic']:
-                if attributes in data_batch:
-                    video_tensor = data_batch[attributes]
-                    data_batch['video'] = video_tensor  # Set as video for compatibility
-                    break
+        possible_shape_keys = ['rgb', 'image', 'basecolor', 'normal', 'depth', 'roughness', 'metallic']
         
+        for key in possible_shape_keys:
+            if key in data_batch:
+                video_tensor = data_batch[key]
+                break
+        
+        # We no longer need to check for the key 'video' specifically, as the noise
+        # will be generated from scratch by the model.
         if video_tensor is None:
-            raise ValueError("No input tensor found in data_batch")
+            raise ValueError(f"No suitable input tensor for shape inference found in data_batch. Looked for {possible_shape_keys}")
         
-        print(f"[Pipeline] Found input tensor shape: {video_tensor.shape} (expected 5D: B,C,T,H,W)")
+        print(f"[Pipeline] Found input tensor for shape inference: {video_tensor.shape} (key='{key}')")
         
         # 3. Ensure model is loaded with correct config for this input shape
         model = self._ensure_model_loaded(video_tensor.shape)
