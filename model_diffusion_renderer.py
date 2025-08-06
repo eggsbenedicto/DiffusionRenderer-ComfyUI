@@ -26,6 +26,13 @@ from torch import Tensor
 from .CleanVAE import CleanVAE
 from .CleanGeneralDIT import CleanDiffusionRendererGeneralDIT
 
+class FourierFeaturesPlaceholder(nn.Module):
+    def __init__(self, num_channels, **kwargs):
+        super().__init__()
+        # These buffers will be overwritten by the state_dict
+        self.register_buffer("freqs", torch.randn(num_channels))
+        self.register_buffer("phases", torch.randn(num_channels))
+    def forward(self, x): return x
 
 class CleanEDMEulerScheduler:
     """Clean implementation of EDM Euler scheduler with proper sigma scheduling"""
@@ -178,7 +185,12 @@ class CleanDiffusionRendererModel(nn.Module):
         
         # Initialize with mock VAE - the pipeline will replace this with a real VAE if available
         self.vae = self._create_mock_vae(vae_config)
-        
+
+        self.logvar = torch.nn.Sequential(
+            FourierFeaturesPlaceholder(num_channels=128),
+            torch.nn.Linear(128, 1, bias=False)
+        )
+
         # Configuration from config dict
         # For inverse rendering: condition only on the input image (like official implementation)
         # For forward rendering: condition on all G-buffer inputs

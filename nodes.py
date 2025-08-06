@@ -222,42 +222,38 @@ class LoadDiffusionRendererModel:
             vae_instance.to(device)
             vae_instance.model.to(dtype)
             print("VAE loaded successfully.")
-        else:
-            print("Using mock VAE (no VAE model specified).")
 
         # --- MEMORY-EFFICIENT MODEL LOADING using META DEVICE ---
         checkpoint_path = folder_paths.get_full_path("diffusion_models", model)
         
-        # 1. Load the state_dict to CPU RAM. This is safe.
         print(f"Loading checkpoint weights to CPU from: {checkpoint_path}")
         state_dict = comfy.utils.load_torch_file(checkpoint_path, safe_load=True)
 
-        # Handle potential nesting and key prefixes
-        if "model" in state_dict: state_dict = state_dict["model"]
+        # Handle potential nesting (e.g., {"model": ..., "ema": ...})
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
 
-        # FINAL FIX: The checkpoint keys are ALL prefixed with `net.`. We must remove it.
-        if any(key.startswith('net.') for key in state_dict.keys()):
-            print("Stripping 'net.' prefix from state_dict keys...")
-            state_dict = {k.replace('net.', '', 1): v for k, v in state_dict.items()}
+        # ------------------- CORRECTED LOADING LOGIC -------------------
+        # The state_dict keys are ALREADY in the correct format (e.g., 'net.block0...', 'logvar.0...').
+        # We do NOT need to strip any prefixes. We load directly into the parent model instance.
 
         print("Instantiating model skeleton on 'meta' device...")
-        basic_config = get_inverse_renderer_config()
+        basic_config = get_inverse_renderer_config() # A basic config to build the skeleton
         with torch.device("meta"):
+             # The model_instance is the PARENT module that contains both `net` and `logvar`
              model_instance = CleanDiffusionRendererModel(basic_config)
 
-        # 3. Materialize the model on the GPU with the correct dtype. This allocates
-        #    the ~28GB of VRAM for the empty bfloat16 tensors.
         print(f"Materializing model on {device} (step 1/2)...")
         model_instance.to_empty(device=device)
 
         print(f"Casting materialized model to {dtype} (step 2/2)...")
         model_instance.to(dtype=dtype)
 
-        # 4. Load the CPU state_dict directly into the materialized GPU model.
-        #    This is an in-place operation and avoids any intermediate copies.
-        print("Loading weights into materialized GPU model...")
-        model_instance.net.load_state_dict(state_dict, strict=True)
-        
+        print("Loading weights into the full materialized GPU model...")
+        # Load into the PARENT model instance. It knows about both `net` and `logvar`.
+        model_instance.load_state_dict(state_dict, strict=True)
+        # ----------------------------------------------------------------
+
         # Clean up the large state_dict from CPU memory
         del state_dict
         mm.soft_empty_cache()
