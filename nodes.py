@@ -39,9 +39,11 @@ import os
 import sys
 import imageio
 import logging
+import json
 
 import folder_paths
 import comfy.model_management as mm
+import comfy.utils
 from comfy.utils import ProgressBar
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
@@ -195,68 +197,82 @@ class LoadDiffusionRendererModel:
     CATEGORY = "Cosmos1"
 
     def load_pipeline(self, model, vae_model="None"):
-        # Load VAE if specified
+        device = mm.get_torch_device()
+        dtype = torch.bfloat16
+        print(f"Targeting device: {device}, dtype: {dtype}")
+
+        # --- VAE LOADING (Robust Offline Method) ---
         vae_instance = None
         if vae_model and vae_model != "None":
-            vae_path = os.path.join(folder_paths.models_dir, "vae", vae_model)
+            vae_path = folder_paths.get_full_path("vae", vae_model)
             print(f"Loading VAE from: {vae_path}")
+
+            if not os.path.exists(VAE_CONFIG_PATH):
+                raise FileNotFoundError(f"VAE config.json not found at {VAE_CONFIG_PATH}. Please create a 'vae_config' subfolder and place the config.json from the stabilityai/cosmo-vae Hugging Face repository inside it.")
+
+            print(f"Loading VAE config from local file: {VAE_CONFIG_PATH}")
+            with open(VAE_CONFIG_PATH, 'r') as f:
+                vae_config_data = json.load(f)
+
+            vae_model_diffusers = AutoencoderKLCosmos.from_config(vae_config_data)
+            sd = comfy.utils.load_torch_file(vae_path)
+            vae_model_diffusers.load_state_dict(sd)
             
-            # Load VAE using our clean implementation
-            if not vae_path.endswith('.safetensors'):
-                raise ValueError(f"Only .safetensors VAE files are supported, got: {vae_path}")
-                
-            print(f"Loading VAE architecture from: {VAE_CONFIG_PATH}")
-            vae_model_diffusers = AutoencoderKLCosmos.from_config(VAE_CONFIG_PATH)
-            
-            print(f"Loading VAE weights from: {vae_path}")
-            from safetensors.torch import load_file
-            state_dict = load_file(vae_path)
-            vae_model_diffusers.load_state_dict(state_dict)
-            
-            # Wrap in our CleanVAE wrapper
             vae_instance = CleanVAE(vae_model_diffusers)
+            vae_instance.to(device)
+            vae_instance.model.to(dtype)
+            print("VAE loaded successfully.")
         else:
-            print("Using mock VAE (no VAE model specified)")
+            print("Using mock VAE (no VAE model specified).")
+
+        # --- MEMORY-EFFICIENT MODEL LOADING using META DEVICE ---
+        checkpoint_path = folder_paths.get_full_path("diffusion_models", model)
         
-        # Load the diffusion model once in the loader node for maximum performance
-        checkpoint_path = os.path.join(folder_paths.models_dir, "diffusion_models", model)
-        print(f"Pre-loading diffusion model from: {checkpoint_path}")
+        # 1. Load the state_dict to CPU RAM. This is safe.
+        print(f"Loading checkpoint weights to CPU from: {checkpoint_path}")
+        state_dict = comfy.utils.load_torch_file(checkpoint_path, safe_load=True)
+
+        # Handle potential nesting and key prefixes
+        if "model" in state_dict: state_dict = state_dict["model"]
+
+        # FINAL FIX: The checkpoint keys are ALL prefixed with `net.`. We must remove it.
+        if any(key.startswith('net.') for key in state_dict.keys()):
+            print("Stripping 'net.' prefix from state_dict keys...")
+            state_dict = {k.replace('net.', '', 1): v for k, v in state_dict.items()}
+
+        print("Instantiating model skeleton on 'meta' device...")
+        basic_config = get_inverse_renderer_config()
+        with torch.device("meta"):
+             model_instance = CleanDiffusionRendererModel(basic_config)
+
+        # 3. Materialize the model on the GPU with the correct dtype. This allocates
+        #    the ~28GB of VRAM for the empty bfloat16 tensors.
+        print(f"Materializing model on {device} (step 1/2)...")
+        model_instance.to_empty(device=device)
+
+        print(f"Casting materialized model to {dtype} (step 2/2)...")
+        model_instance.to(dtype=dtype)
+
+        # 4. Load the CPU state_dict directly into the materialized GPU model.
+        #    This is an in-place operation and avoids any intermediate copies.
+        print("Loading weights into materialized GPU model...")
+        model_instance.net.load_state_dict(state_dict, strict=True)
         
-        # Validate checkpoint format
-        if not (checkpoint_path.endswith('.pt') or checkpoint_path.endswith('.safetensors')):
-            raise ValueError(f"Only .pt and .safetensors diffusion model files are supported, got: {checkpoint_path}")
-        
-        # Create model instance with a basic config to establish the structure
-        # The pipeline will later swap in the correct config for dynamic inference
-        basic_config = get_inverse_renderer_config(height=1024, width=1024, num_frames=1)
-        
-        model_instance = CleanDiffusionRendererModel(basic_config)
-        
-        # Load the checkpoint weights into the model
-        print(f"Loading diffusion model checkpoint: {checkpoint_path}")
-        model_instance.load_checkpoint(checkpoint_path, strict=True)
-        
-        # Move to appropriate device and precision
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model_instance = model_instance.to(device)
-        
-        print(f"✅ Pre-loaded diffusion model successfully")
-        print(f"  - Model type: Will be set dynamically by pipeline")
-        print(f"  - Device: {device}")
-        print(f"  - Parameters: {sum(p.numel() for p in model_instance.parameters() if p.requires_grad):,}")
-            
+        # Clean up the large state_dict from CPU memory
+        del state_dict
+        mm.soft_empty_cache()
+
+        model_instance.eval()
+        print(f"✅ Pre-loaded diffusion model successfully to {device}")
+
         pipeline = CleanDiffusionRendererPipeline(
-            checkpoint_dir=os.path.join(folder_paths.models_dir, "diffusion_models"),
-            checkpoint_name=model,
-            model_type=None,  # Will be set by inference nodes
-            vae_instance=vae_instance,  # Pass loaded VAE instance
-            model_instance=model_instance,  # Pass pre-loaded diffusion model instance
-            # These are default values - actual dimensions will be inferred from input tensors
+            checkpoint_dir=os.path.dirname(checkpoint_path),
+            checkpoint_name=os.path.basename(checkpoint_path),
+            model_type=None,
+            vae_instance=vae_instance,
+            model_instance=model_instance,
             guidance=0.0,
             num_steps=15,
-            height=1024,  # Default, will be overridden by input
-            width=1024,   # Default, will be overridden by input
-            num_video_frames=1,  # Default, will be overridden by input
             seed=42,
         )
         return (pipeline,)
