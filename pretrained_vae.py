@@ -526,31 +526,13 @@ class JointImageVideoTokenizer(BaseVAE, VideoTokenizerInterface):
         self.squeeze_for_image = squeeze_for_image
 
     def encode_image(self, state: torch.Tensor) -> torch.Tensor:
-        # state is 5D: (B, C, T, H, W)
-        if self.squeeze_for_image:
-            # Squeeze time dim to get 4D tensor for CleanVAE
-            state_4d = state.squeeze(2)
-            
-            # Get 4D latent from CleanVAE
-            latent_4d = self.image_vae.encode(state_4d)
-            
-            # Add time dim back to create 5D latent for the pipeline
-            return latent_4d.unsqueeze(2)
-            
+        # state is 5D. The image_vae now correctly handles 5D tensors with T=1.
+        # We no longer squeeze the time dimension.
         return self.image_vae.encode(state)
 
     def decode_image(self, latent: torch.Tensor) -> torch.Tensor:
-        # latent is 5D: (B, C, T, H, W)
-        if self.squeeze_for_image:
-            # Squeeze time dim to get 4D latent for CleanVAE
-            latent_4d = latent.squeeze(2)
-            
-            # Get 4D image from CleanVAE
-            state_4d = self.image_vae.decode(latent_4d)
-            
-            # Add time dim back to create 5D tensor for the pipeline
-            return state_4d.unsqueeze(2)
-
+        # latent is 5D. The image_vae now correctly handles 5D latents with T=1.
+        # We no longer squeeze the time dimension.
         return self.image_vae.decode(latent)
 
     @torch.no_grad()

@@ -8,8 +8,8 @@ from diffusers import AutoencoderKLCosmos
 
 class CleanVAE:
     """
-    A pure 4D wrapper for the diffusers AutoencoderKLCosmos for single-frame encoding/decoding.
-    It accepts and returns standard 4D (B, C, H, W) tensors.
+    A pure pass-through wrapper for the diffusers AutoencoderKLCosmos.
+    It accepts and returns 5D tensors (B, C, T, H, W) as required by the underlying 3D model.
     """
     
     def __init__(self, model_path: str):
@@ -39,21 +39,21 @@ class CleanVAE:
         return 1
     
     @torch.no_grad()
-    def encode(self, state_4d: torch.Tensor) -> torch.Tensor:
-        """ Encodes a 4D (B, C, H, W) tensor. """
-        if state_4d.ndim != 4:
-            raise ValueError(f"CleanVAE (Image VAE) expects a 4D input (B, C, H, W), but got {state_4d.shape}")
+    def encode(self, state_5d: torch.Tensor) -> torch.Tensor:
+        """ Encodes a 5D (B, C, T, H, W) tensor. """
+        if state_5d.ndim != 5:
+            raise ValueError(f"CleanVAE (Image VAE) expects a 5D input (B, C, T, H, W), but got {state_5d.shape}")
         
-        encoded = self.model.encode(state_4d)
+        encoded = self.model.encode(state_5d)
         return encoded.latent_dist.sample()
     
     @torch.no_grad()
-    def decode(self, latent_4d: torch.Tensor) -> torch.Tensor:
-        """ Decodes a 4D (B, C, H, W) latent tensor. """
-        if latent_4d.ndim != 4:
-            raise ValueError(f"CleanVAE (Image VAE) expects a 4D latent (B, C, H, W), but got {latent_4d.shape}")
+    def decode(self, latent_5d: torch.Tensor) -> torch.Tensor:
+        """ Decodes a 5D (B, C, T, H, W) latent tensor. """
+        if latent_5d.ndim != 5:
+            raise ValueError(f"CleanVAE (Image VAE) expects a 5D latent (B, C, T, H, W), but got {latent_5d.shape}")
 
-        decoded = self.model.decode(latent_4d)
+        decoded = self.model.decode(latent_5d)
         return decoded.sample
     
     def to(self, device):
