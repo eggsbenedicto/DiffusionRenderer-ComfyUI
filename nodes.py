@@ -84,7 +84,7 @@ class LoadDiffusionRendererModel:
         
         # This path should point to the root of the tokenizer repo
         # e.g., ComfyUI/models/vae/Cosmos-1.0-Tokenizer-CV8x8x8/
-        vae_main_dir = folder_paths.get_full_path("vae", "Cosmos-1.0-Tokenizer-CV8x8x8")
+        vae_main_dir = os.path.join(folder_paths.models_dir, "vae", "Cosmos-1.0-Tokenizer-CV8x8x8")
         print(f"Loading composite VAE from main directory: {vae_main_dir}")
 
         # --- PART A: Load the IMAGE VAE (from the '/vae' subdirectory) ---

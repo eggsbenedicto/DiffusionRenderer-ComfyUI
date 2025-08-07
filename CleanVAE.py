@@ -35,7 +35,7 @@ class CleanVAE:
         
         # Essential properties for compatibility with the rest of the pipeline
         self.latent_ch = self.config.latent_channels
-        self.spatial_compression_ratio = self.config.scaling_factor # Diffusers calls it scaling_factor
+        self.spatial_compression_ratio = self.model.scaling_factor # Diffusers calls it scaling_factor
         
         print(f"CleanVAE (Image VAE) initialized successfully:")
         print(f"  - Latent channels: {self.latent_ch}")
