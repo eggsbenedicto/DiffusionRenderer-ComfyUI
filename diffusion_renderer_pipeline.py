@@ -266,7 +266,6 @@ class CleanDiffusionRendererPipeline:
         # 3. Ensure model is loaded with correct config for this input shape
         model = self._ensure_model_loaded(video_tensor.shape)
         
-        # 4. Calculate state shape using dynamic config
         config_latent_shape = self.config['latent_shape']  # [C, T, H, W]
         C, expected_T, expected_H, expected_W = config_latent_shape
         
@@ -312,7 +311,10 @@ class CleanDiffusionRendererPipeline:
         # 7. Convert to numpy (exact logic from original)
         video = (1.0 + video).clamp(0, 2) / 2
         print(f"[Pipeline] Before permute/convert, video shape: {video.shape}")
-        video = (video[0].permute(1, 2, 3, 0) * 255).to(torch.uint8).cpu().numpy()
+        
+        # Permute to ComfyUI format: (B, T, H, W, C)
+        video = video.permute(0, 2, 3, 4, 1)
+        video = (video * 255).to(torch.uint8).cpu().numpy()
         print(f"[Pipeline] Final numpy output shape: {video.shape}")
         
         return video

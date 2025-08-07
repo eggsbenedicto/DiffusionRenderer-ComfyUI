@@ -49,27 +49,20 @@ from comfy.utils import ProgressBar
 script_directory = os.path.dirname(os.path.abspath(__file__))
 VAE_CONFIG_PATH = os.path.join(script_directory, "VAE_config.json")  # Placeholder, as requested
 
-# Import our clean VAE implementation
 from .CleanVAE import CleanVAE
 from diffusers import AutoencoderKLCosmos
 
-# Use our clean pipeline instead of the original kludgy one
 from .diffusion_renderer_pipeline import CleanDiffusionRendererPipeline
 from .model_diffusion_renderer import CleanDiffusionRendererModel
 from .diffusion_renderer_config import get_inverse_renderer_config
 
-# Import new environment map processing system
-try:
-    from preprocess_envmap import (
-        process_environment_map_robust,
-        latlong_vec,
-        clear_environment_cache,
-        get_cache_stats
-    )
-    ENVMAP_SYSTEM_AVAILABLE = True
-except ImportError as e:
-    logging.warning(f"Advanced environment map processing not available: {e}")
-    ENVMAP_SYSTEM_AVAILABLE = False
+from .preprocess_envmap import (
+    render_projection_from_panorama,
+    tonemap_image_direct,
+    latlong_vec,
+    clear_environment_cache,
+    get_cache_stats
+)
 
 # Extracted utilities from the original codebase without dependencies
 # Official mapping from cosmos_predict1/diffusion/inference/diffusion_renderer_utils/rendering_utils.py
@@ -80,89 +73,6 @@ GBUFFER_INDEX_MAPPING = {
     "normal": 3,
     "depth": 4,
 }
-
-def envmap_vec_fallback(resolution, device):
-    """Environment map direction vectors using official algorithm (fallback when preprocess_envmap is not available)"""
-    H, W = resolution
-    
-    # Exact replication of official latlong_vec algorithm
-    gy, gx = torch.meshgrid(
-        torch.linspace(0.0 + 1.0 / H, 1.0 - 1.0 / H, H, device=device), 
-        torch.linspace(-1.0 + 1.0 / W, 1.0 - 1.0 / W, W, device=device),
-        indexing='ij'
-    )
-    
-    sintheta, costheta = torch.sin(gy*np.pi), torch.cos(gy*np.pi)
-    sinphi, cosphi = torch.sin(gx*np.pi), torch.cos(gx*np.pi)
-    
-    dir_vec = torch.stack((
-        sintheta*sinphi, 
-        costheta, 
-        -sintheta*cosphi
-    ), dim=-1)
-    
-    # Apply official envmap_vec transformation: -latlong_vec().flip(0).flip(1)
-    return -dir_vec.flip(0).flip(1)
-
-def official_hdr_processing(env_tensor, log_scale=10000):
-    """Implement official HDR processing pipeline without dependencies"""
-    
-    # Official NaN/Inf cleanup
-    env_tensor = torch.nan_to_num(env_tensor, nan=0.0, posinf=65504.0, neginf=0.0)
-    env_tensor = env_tensor.clamp(0.0, 65504.0)
-    
-    # Official Reinhard tone mapping (exact algorithm)
-    def reinhard_official(x, max_point=16):
-        return x * (1 + x / (max_point ** 2)) / (1 + x)
-    
-    # Official RGB to sRGB conversion
-    def rgb2srgb_official(rgb):
-        return torch.where(rgb <= 0.0031308, 12.92 * rgb, 1.055 * rgb**(1/2.4) - 0.055)
-    
-    # Apply official tone mapping
-    env_ldr = rgb2srgb_official(reinhard_official(env_tensor, max_point=16).clamp(0, 1))
-    env_log = rgb2srgb_official(torch.log1p(env_tensor) / np.log1p(log_scale)).clamp(0, 1)
-    
-    return env_ldr, env_log
-
-def process_environment_map_fallback(env_map_path, resolution, num_frames, fixed_pose, rotate_envlight, env_format, device):
-    """Enhanced environment map processing using official algorithms (fallback when preprocess_envmap is not available)"""
-    import imageio
-    
-    H, W = resolution
-    
-    # Load the HDR environment map
-    env_map = imageio.imread(env_map_path)
-    
-    # Convert to tensor
-    env_tensor = torch.from_numpy(env_map).float().to(device)
-    if env_tensor.ndim == 2:
-        env_tensor = env_tensor.unsqueeze(-1).repeat(1, 1, 3)
-    
-    # Resize to target resolution if needed
-    if env_tensor.shape[:2] != (H, W):
-        env_tensor = torch.nn.functional.interpolate(
-            env_tensor.permute(2, 0, 1).unsqueeze(0), 
-            size=(H, W), 
-            mode='bilinear', 
-            align_corners=False
-        ).squeeze(0).permute(1, 2, 0)
-    
-    # Use official HDR processing instead of simple normalization
-    env_ldr, env_log = official_hdr_processing(env_tensor, log_scale=10000)
-    
-    # Expand for video frames if needed
-    if num_frames > 1:
-        env_ldr = env_ldr.unsqueeze(0).expand(num_frames, -1, -1, -1)
-        env_log = env_log.unsqueeze(0).expand(num_frames, -1, -1, -1)
-    else:
-        env_ldr = env_ldr.unsqueeze(0)
-        env_log = env_log.unsqueeze(0)
-    
-    return {
-        'env_ldr': env_ldr,
-        'env_log': env_log,
-    }
 
 # Helper function to convert tensors to PIL images
 def tensor_to_pil(tensor):
@@ -293,68 +203,87 @@ class Cosmos1InverseRenderer:
     CATEGORY = "Cosmos1"
 
     def run_inverse_pass(self, pipeline, image, guidance=0.0, seed=42):
-        # Set model type based on node being used (inverse renderer)
         pipeline.set_model_type("inverse")
-        
-        # Configure pipeline with runtime parameters
         pipeline.guidance = guidance
         pipeline.seed = seed
 
-        # Standardize image input to a 5D tensor (B, T, H, W, C)
-        print(f"[Nodes] Inverse renderer input image type: {type(image)}")
+        # === ROBUST INPUT HANDLING START ===
+        
+        print(f"[Nodes] Received input of type: {type(image)}")
+        
+        # 1. Handle list of tensors (common for batched inputs from other nodes)
         if isinstance(image, list):
-            image = torch.stack(image)
-            print(f"[Nodes] Stacked list to tensor: {image.shape}")
-        if image.ndim == 4:
-            image = image.unsqueeze(0)
-            print(f"[Nodes] Added batch dimension: {image.shape}")
+            # Each item in the list is typically (T, H, W, C)
+            # Stacking on a new dimension 0 creates (B, T, H, W, C)
+            print(f"[Nodes] Input is a list. Stacking {len(image)} tensors.")
+            try:
+                image_5d = torch.stack(image, dim=0)
+            except Exception as e:
+                # Fallback for lists of varying shapes, process the first one.
+                print(f"Warning: Could not stack tensors in list due to varying shapes: {e}. Processing first item only.")
+                image_5d = image[0].unsqueeze(0) # Add a batch dim
+        
+        # 2. Handle single tensor input
+        elif isinstance(image, torch.Tensor):
+            # Check dimensions and add batch/temporal dims if missing
+            if image.ndim == 3: # Shape (H, W, C)
+                print("[Nodes] Input is a 3D tensor (H,W,C). Adding Batch and Time dimensions.")
+                image_5d = image.unsqueeze(0).unsqueeze(0) # -> (1, 1, H, W, C)
+            elif image.ndim == 4: # Shape (B, H, W, C) or (T, H, W, C) - ComfyUI standard is ambiguous
+                # We'll assume it's (B, H, W, C) and add a temporal dimension of 1
+                print("[Nodes] Input is a 4D tensor. Assuming (B,H,W,C) and adding Time dimension.")
+                image_5d = image.unsqueeze(1) # -> (B, 1, H, W, C)
+            elif image.ndim == 5: # Shape (B, T, H, W, C)
+                print("[Nodes] Input is a 5D tensor (B,T,H,W,C). Using as is.")
+                image_5d = image
+            else:
+                raise ValueError(f"Unsupported tensor dimension: {image.ndim}. Expected 3D, 4D, or 5D.")
+        else:
+            raise TypeError(f"Unsupported input type: {type(image)}. Expected torch.Tensor or list of Tensors.")
 
-        B, T, H, W, C = image.shape
-        print(f"[Nodes] Final input shape: {image.shape} (B={B}, T={T}, H={H}, W={W}, C={C})")
-        pipeline.num_video_frames = T
-        pipeline.height = H
-        pipeline.width = W
+        print(f"[Nodes] Standardized input to 5D tensor with shape: {image_5d.shape}")
 
-        pbar = ProgressBar(B)
-        # Use official order: basecolor, metallic, roughness, normal, depth (indices 0, 1, 2, 3, 4)
+        # === PRE-PROCESSING FOR MODEL ===
+        
+        # 3. Permute from (B, T, H, W, C) to model's expected (B, C, T, H, W)
+        image_tensor = image_5d.permute(0, 4, 1, 2, 3)
+        
+        # 4. Normalize range from [0, 1] to [-1, 1]
+        image_tensor = image_tensor * 2.0 - 1.0
+        
+        print(f"[Nodes] Pre-processed input for model with shape: {image_tensor.shape}")
+        
+        # === INFERENCE LOGIC (NOW BATCH-EFFICIENT) ===
+
+        # Use official order
         inference_passes = ["basecolor", "metallic", "roughness", "normal", "depth"]
-        batch_outputs = {pass_name: [] for pass_name in inference_passes}
+        outputs = {}
+        pbar = ProgressBar(len(inference_passes))
 
-        for i in range(B):
-            image_slice = image[i] # Shape: (T, H, W, C)
-            print(f"[Nodes] Processing batch {i}, image_slice shape: {image_slice.shape}")
+        for gbuffer_pass in inference_passes:
+            context_index = GBUFFER_INDEX_MAPPING[gbuffer_pass]
             
-            # Pipeline expects image shape (1, T, C, H, W)
-            image_tensor = image_slice.permute(0, 3, 1, 2).unsqueeze(0)
-            print(f"[Nodes] Prepared image_tensor for pipeline: {image_tensor.shape} (expected: 1,T,C,H,W)")
-
+            # Create data_batch for the entire batch
             data_batch = {
                 "rgb": image_tensor,
-                "video": image_tensor, # Add this so the pipeline can find a tensor for shape inference
-                "context_index": torch.zeros(1, 1, dtype=torch.long),
+                "video": image_tensor, # For shape inference in the pipeline
+                "context_index": torch.full((image_tensor.shape[0], 1), context_index, dtype=torch.long),
             }
+            print(f"[Nodes] Running {gbuffer_pass} pass with context_index={context_index}")
 
-            for gbuffer_pass in inference_passes:
-                # Set context_index to specify which G-buffer pass to generate
-                # This is required for inverse renderer (matches official implementation)
-                context_index = GBUFFER_INDEX_MAPPING[gbuffer_pass]
-                data_batch["context_index"].fill_(context_index)
-                print(f"[Nodes] Running {gbuffer_pass} pass with context_index={context_index}")
-
-                output_tensor = pipeline.generate_video(
-                    data_batch=data_batch,
-                    normalize_normal=(gbuffer_pass == 'normal'),
-                    seed=seed + i, # Use a different seed for each image in the batch
-                )
-                print(f"[Nodes] {gbuffer_pass} output shape: {output_tensor.shape}")
-                batch_outputs[gbuffer_pass].append(output_tensor)
+            # Single pipeline call for the whole batch
+            output_array = pipeline.generate_video(
+                data_batch=data_batch,
+                normalize_normal=(gbuffer_pass == 'normal'),
+                seed=seed,
+            )
+            
+            # Post-process numpy array (B, T, H, W, C) back to ComfyUI IMAGE tensor
+            output_tensor = torch.from_numpy(output_array).float() / 255.0
+            
+            outputs[gbuffer_pass] = output_tensor
             pbar.update(1)
 
-        # Stack results from all videos in the batch
-        outputs = {pass_name: torch.cat(batch_outputs[pass_name], dim=0) for pass_name in inference_passes}
-        print(f"[Nodes] Final outputs shapes: {[(k, v.shape) for k, v in outputs.items()]}")
-        
-        # Return in official order: basecolor, metallic, roughness, normal, depth
         return (outputs["basecolor"], outputs["metallic"], outputs["roughness"], outputs["normal"], outputs["depth"])
 
 
@@ -374,12 +303,21 @@ class Cosmos1ForwardRenderer:
             "optional": {
                 "guidance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-                # Enhanced environment map controls (only available with new system)
-                "env_format": (["proj", "ball", "fixed"], {"default": "proj", "tooltip": "proj: equirectangular, ball: chrome ball, fixed: fixed format"}),
-                "env_brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1, "tooltip": "Environment map brightness multiplier"}),
-                "env_flip_horizontal": ("BOOLEAN", {"default": False, "tooltip": "Flip environment map horizontally"}),
-                "env_flip_vertical": ("BOOLEAN", {"default": False, "tooltip": "Flip environment map vertically"}),
-                "env_rotation": ("FLOAT", {"default": 180.0, "min": 0, "max": 360, "step": 1.0, "tooltip": "Rotate environment map (degrees)"}),
+                
+                # --- Refactored Environment Map Controls ---
+                "env_format": (["proj", "ball"], {
+                    "default": "proj", 
+                    "tooltip": "'proj': Input is a panoramic HDR. 'ball': Input is a square, pre-rendered chrome ball HDR."
+                }),
+                "env_brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1, 
+                    "tooltip": "Adjust brightness of the environment map ('proj' mode only)."
+                }),
+                "env_flip_horizontal": ("BOOLEAN", {"default": False, 
+                    "tooltip": "Flip the panoramic environment map horizontally ('proj' mode only)."
+                }),
+                "env_rotation": ("FLOAT", {"default": 180.0, "min": 0, "max": 360, "step": 1.0, 
+                    "tooltip": "Rotate the panoramic environment map ('proj' mode only)."
+                }),
             }
         }
 
@@ -388,185 +326,107 @@ class Cosmos1ForwardRenderer:
     CATEGORY = "Cosmos1"
 
     def run_forward_pass(self, pipeline, depth, normal, roughness, metallic, base_color, env_map, 
-                        guidance=0.0, seed=42, env_format="ball", env_brightness=1.0, 
-                        env_flip_horizontal=False, env_flip_vertical=False, env_rotation=0.0):
-        # Set model type based on node being used (forward renderer)
-        pipeline.set_model_type("forward")
+                        guidance=0.0, seed=42, env_format="proj", env_brightness=1.0, 
+                        env_flip_horizontal=False, env_rotation=0.0):
         
-        # Standardize all inputs to 5D tensors (B, T, H, W, C)
-        gbuffer_tensors = {
-            "depth": depth,
-            "normal": normal,
-            "roughness": roughness,
-            "metallic": metallic,
-            "base_color": base_color,
-            "env_map": env_map,
-        }
-
-        print(f"[Nodes] Forward renderer input tensor types and shapes:")
-        for name, tensor in gbuffer_tensors.items():
-            print(f"[Nodes]   {name}: {type(tensor)}, shape: {tensor.shape if hasattr(tensor, 'shape') else 'no shape'}")
-
-        # Standardize tensors and handle lists
-        for name, tensor in gbuffer_tensors.items():
-            original_shape = tensor.shape if hasattr(tensor, 'shape') else 'unknown'
-            if isinstance(tensor, list):
-                tensor = torch.stack(tensor)
-                print(f"[Nodes] Stacked {name} list: {original_shape} -> {tensor.shape}")
-            if tensor.ndim == 4:
-                tensor = tensor.unsqueeze(0) # Add batch dimension
-                print(f"[Nodes] Added batch dim to {name}: {tensor.shape}")
-            gbuffer_tensors[name] = tensor
-
-        # Get dimensions from the primary input
-        B, T, H, W, C = gbuffer_tensors["depth"].shape
-        print(f"[Nodes] Primary dimensions from depth: B={B}, T={T}, H={H}, W={W}, C={C}")
-
-        # Configure pipeline with runtime parameters
+        pipeline.set_model_type("forward")
         pipeline.guidance = guidance
         pipeline.seed = seed
-        pipeline.num_video_frames = T
-        pipeline.height = H
-        pipeline.width = W
 
-        device = mm.get_torch_device()
-        pbar = ProgressBar(B)
-        output_videos = []
-
-        # Process each video in the batch
-        for i in range(B):
-            print(f"[Nodes] Processing forward batch {i}/{B}")
-            # Prepare G-buffer inputs for the current video
-            # Note: Forward renderer does NOT use context_index - it processes all G-buffers simultaneously
-            # This matches the official implementation where all maps are fed together
-            data_batch = {}
-            # Map ComfyUI tensor names to official Cosmos1 keys
-            key_mapping = {
-                "base_color": "basecolor",  # ComfyUI uses "base_color", official uses "basecolor"
-                "depth": "depth",
-                "normal": "normal", 
-                "roughness": "roughness",
-                "metallic": "metallic"
-            }
-            
-            for name in ["depth", "normal", "roughness", "metallic", "base_color"]:
-                tensor_slice = gbuffer_tensors[name][i] # (T, H, W, C)
-                print(f"[Nodes]   {name} slice shape: {tensor_slice.shape}")
-                # Pipeline expects (1, T, C, H, W) and range [-1, 1]
-                # ComfyUI provides data in [0, 1], official expects [-1, 1]
-                processed_tensor = tensor_slice.permute(0, 3, 1, 2).unsqueeze(0)
-                print(f"[Nodes]   {name} processed shape: {processed_tensor.shape} (expected: 1,T,C,H,W)")
-                official_key = key_mapping[name]
-                data_batch[official_key] = processed_tensor * 2.0 - 1.0
-
-            # Process the environment map for the current video
-            env_map_slice = gbuffer_tensors["env_map"][i] # (T, H, W, C)
-            print(f"[Nodes] env_map slice shape: {env_map_slice.shape}")
-            
-            
-            # Use the new robust environment map processing system if available
-            if ENVMAP_SYSTEM_AVAILABLE:
-                try:
-                    # Convert ComfyUI IMAGE tensor to the format expected by the preprocessing system
-                    env_map_np = env_map_slice.cpu().numpy()
-                    # Take first frame for processing (environment maps are typically static)
-                    if env_map_np.shape[0] >= 1:
-                        env_map_np = env_map_np[0]  # Always take first frame for environment processing
-                    
-                    envlight_dict = process_environment_map_robust(
-                        env_input=env_map_np,  # Pass numpy array directly
-                        resolution=(H, W),
-                        num_frames=T,
-                        env_format=env_format,
-                        env_brightness=env_brightness,
-                        env_flip_horizontal=env_flip_horizontal,
-                        env_flip_vertical=env_flip_vertical,
-                        env_rotation=env_rotation,
-                        device=device,
-                    )
-                    
-                    env_ldr = envlight_dict['env_ldr'].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
-                    env_log = envlight_dict['env_log'].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
-                    env_nrm = latlong_vec(resolution=(H, W), device=device)
-                    env_nrm = env_nrm.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3).expand_as(env_ldr)
-                    
-                    data_batch['env_ldr'] = env_ldr
-                    data_batch['env_log'] = env_log
-                    data_batch['env_nrm'] = env_nrm
-                    
-                except Exception as e:
-                    logging.warning(f"Advanced environment processing failed, falling back to enhanced method: {e}")
-                    # Enhanced fallback processing with official algorithms
-                    envlight_dict = self._process_env_fallback(env_map_slice, H, W, T, device, i)
-                    env_ldr = envlight_dict['env_ldr'].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
-                    env_log = envlight_dict['env_log'].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
-                    
-                    # Use official envmap_vec algorithm
-                    env_nrm = envmap_vec_fallback([H, W], device=device)
-                    env_nrm = env_nrm.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3).expand_as(env_ldr)
-                    
-                    data_batch['env_ldr'] = env_ldr
-                    data_batch['env_log'] = env_log
-                    data_batch['env_nrm'] = env_nrm
-            else:
-                # Enhanced processing with official algorithms when new system is not available
-                envlight_dict = self._process_env_fallback(env_map_slice, H, W, T, device, i)
-                env_ldr = envlight_dict['env_ldr'].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
-                env_log = envlight_dict['env_log'].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
-                
-                # Use official envmap_vec algorithm
-                env_nrm = envmap_vec_fallback([H, W], device=device)
-                env_nrm = env_nrm.unsqueeze(0).unsqueeze(0).permute(0, 4, 1, 2, 3).expand_as(env_ldr)
-                
-                data_batch['env_ldr'] = env_ldr
-                data_batch['env_log'] = env_log
-                data_batch['env_nrm'] = env_nrm
-
-            # Generate the final image for the current video
-            output_tensor = pipeline.generate_video(
-                data_batch=data_batch,
-                seed=seed + i, # Use a different seed for each image in the batch
-            )
-            output_videos.append(output_tensor)
-            pbar.update(1)
-
-        # Stack results into a single batch tensor
-        final_output = torch.cat(output_videos, dim=0)
-
-        # The output is in range [-1, 1], so we scale it back to [0, 1]
-        final_output = (final_output + 1.0) / 2.0
-
-        return (final_output,)
-
-    def _process_env_fallback(self, env_map_slice, H, W, T, device, batch_idx):
-        """Enhanced environment map processing for fallback using official algorithms"""
-        import imageio
-        temp_env_map_path = os.path.join(folder_paths.get_temp_directory(), f"temp_env_map_{batch_idx}.hdr")
+        # === 1. G-BUFFER INPUT HANDLING ===
+        # Standardize all G-buffer inputs into 5D tensors: (B, T, H, W, C)
+        gbuffer_tensors_in = {
+            "depth": depth, "normal": normal, "roughness": roughness,
+            "metallic": metallic, "base_color": base_color,
+        }
         
-        env_map_np = env_map_slice.cpu().numpy()
-        # Take first frame for processing (environment maps are typically static)
-        if env_map_np.shape[0] >= 1:
-            env_map_np = env_map_np[0]  # Always take first frame for environment processing
+        gbuffer_tensors_5d = {}
+        for name, tensor_in in gbuffer_tensors_in.items():
+            if isinstance(tensor_in, list):
+                tensor_5d = torch.stack(tensor_in, dim=0)
+            elif isinstance(tensor_in, torch.Tensor):
+                if tensor_in.ndim == 3: tensor_5d = tensor_in.unsqueeze(0).unsqueeze(0)
+                elif tensor_in.ndim == 4: tensor_5d = tensor_in.unsqueeze(1)
+                elif tensor_in.ndim == 5: tensor_5d = tensor_in
+                else: raise ValueError(f"Unsupported tensor dimension for '{name}': {tensor_in.ndim}")
+            else: raise TypeError(f"Unsupported input type for '{name}': {type(tensor_in)}")
+            gbuffer_tensors_5d[name] = tensor_5d
+        
+        # === 2. G-BUFFER PRE-PROCESSING ===
+        # Get unified dimensions and device from a primary input
+        B, T, H, W, C = gbuffer_tensors_5d["depth"].shape
+        device = mm.get_torch_device()
+        
+        # Create the data_batch for the model and populate it with G-buffers
+        data_batch = {}
+        key_mapping = {"base_color": "basecolor", "depth": "depth", "normal": "normal", 
+                       "roughness": "roughness", "metallic": "metallic"}
 
-        imageio.imwrite(temp_env_map_path, env_map_np)
+        for name, tensor_5d in gbuffer_tensors_5d.items():
+            # Permute from (B,T,H,W,C) to model's (B,C,T,H,W) and normalize [0,1] to [-1,1]
+            processed_tensor = tensor_5d.permute(0, 4, 1, 2, 3) * 2.0 - 1.0
+            data_batch[key_mapping[name]] = processed_tensor
+        
+        # Use one G-buffer map for shape inference inside the pipeline
+        data_batch['video'] = data_batch['depth']
 
-        envlight_dict = process_environment_map_fallback(
-            temp_env_map_path,
-            resolution=(H, W),
-            num_frames=T,
-            fixed_pose=True,
-            rotate_envlight=False,
-            env_format=['proj'],
-            device=device,
+        # === 3. ENVIRONMENT MAP PROCESSING (Refactored Logic) ===
+        # Dispatch to the correct processing function based on the chosen format.
+        envlight_dict = None
+        if env_format == 'proj':
+            print("[Nodes] Processing env_map as panoramic projection ('proj' mode).")
+            envlight_dict = render_projection_from_panorama(
+                env_input=env_map,
+                resolution=(H, W),
+                num_frames=T,
+                device=device,
+                env_brightness=env_brightness,
+                env_flip=env_flip_horizontal,
+                env_rot=env_rotation
+            )
+        elif env_format == 'ball':
+            print("[Nodes] Processing env_map as a direct tonemap of a pre-rendered ball ('ball' mode).")
+            if H != W:
+                logging.warning(f"Ball mode expects a square input, but G-buffers are {W}x{H}. Results may be distorted.")
+            envlight_dict = tonemap_image_direct(
+                env_input=env_map,
+                resolution=(H, W),
+                num_frames=T,
+                device=device
+            )
+
+        # === 4. PREPARE FINAL CONDITIONING TENSORS ===
+        # The output of both envmap functions is a dict with (T, H, W, C) tensors in [0,1] range.
+        # We must prepare them for the model: (B, C, T, H, W) in [-1,1] range.
+        
+        # Reshape and normalize LDR map
+        env_ldr = envlight_dict['env_ldr'].permute(3, 0, 1, 2).unsqueeze(0) # (1, C, T, H, W)
+        env_ldr = env_ldr * 2.0 - 1.0
+
+        # Reshape and normalize LOG map
+        env_log = envlight_dict['env_log'].permute(3, 0, 1, 2).unsqueeze(0) # (1, C, T, H, W)
+        env_log = env_log * 2.0 - 1.0
+
+        # Generate direction vectors for the environment normal map
+        env_nrm = latlong_vec(resolution=(H, W), device=device)       # -> (H, W, C)
+        env_nrm = env_nrm.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # -> (1, C, 1, H, W)
+
+        # Add to data_batch and expand to match the input batch size (B) and time (T)
+        data_batch['env_ldr'] = env_ldr.expand(B, -1, -1, -1, -1)
+        data_batch['env_log'] = env_log.expand(B, -1, -1, -1, -1)
+        data_batch['env_nrm'] = env_nrm.expand(B, -1, T, -1, -1)
+
+        # === 5. INFERENCE AND POST-PROCESSING ===
+        print("[Nodes] Data batch prepared. Calling diffusion pipeline...")
+        output_array = pipeline.generate_video(
+            data_batch=data_batch,
+            seed=seed,
         )
         
-        # Clean up temporary file
-        try:
-            os.remove(temp_env_map_path)
-        except:
-            pass
-            
-        return envlight_dict
+        # Convert final numpy array back to a ComfyUI IMAGE tensor
+        final_output = torch.from_numpy(output_array).float() / 255.0
+
+        return (final_output,)
     
 class LoadHDRImage:
     @classmethod

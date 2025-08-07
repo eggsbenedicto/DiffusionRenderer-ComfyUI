@@ -13,6 +13,7 @@ from typing import Union, Tuple, Dict, Optional, List
 from pathlib import Path
 import hashlib
 import time
+import nvdiffrast.torch as dr
 
 # Enable OpenEXR support
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
@@ -346,71 +347,10 @@ def rotate_y(angle: float, device: str = 'cuda') -> torch.Tensor:
         [0, 0, 0, 1]
     ], dtype=torch.float32, device=device)
 
-def sample_cubemap_gpu(cubemap: torch.Tensor, directions: torch.Tensor) -> torch.Tensor:
-    """Sample cubemap using direction vectors with GPU acceleration"""
-    # Convert directions to cubemap sampling coordinates
-    # This is a simplified version - full implementation would need proper cube face selection
-    batch_size = directions.shape[0]
-    H, W = directions.shape[1:3]
-    
-    # Normalize directions
-    directions = safe_normalize(directions.view(-1, 3))
-    
-    # Convert to spherical coordinates for sampling
-    # This is a fallback - proper implementation needs cube face logic
-    phi = torch.atan2(directions[:, 0], -directions[:, 2]) / (2 * np.pi) + 0.5
-    theta = torch.acos(torch.clamp(directions[:, 1], -1, 1)) / np.pi
-    
-    # Create grid for sampling
-    grid_coords = torch.stack([phi, theta], dim=-1) * 2.0 - 1.0
-    grid_coords = grid_coords.view(batch_size, H, W, 2)
-    
-    # Use average of all cube faces as approximation
-    avg_cubemap = cubemap.mean(dim=0).permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
-    
-    sampled = torch.nn.functional.grid_sample(
-        avg_cubemap, grid_coords,
-        mode='bilinear', padding_mode='border', align_corners=False
-    )
+
     
     return sampled.squeeze(0).permute(1, 2, 0)  # (H, W, C)
 
-def process_projected_envmap_official(cubemap: torch.Tensor, vec: torch.Tensor, 
-                                    c2w: torch.Tensor, y_rot: torch.Tensor, 
-                                    H: int, W: int) -> torch.Tensor:
-    """Camera-aligned environment projection (most common format)"""
-    # Transform direction vectors by camera and rotation matrices
-    vec_cam = vec.view(-1, 3) @ c2w[:3, :3].T
-    vec_query = (vec_cam @ y_rot[:3, :3].T).view(1, H, W, 3)
-    
-    # Sample cubemap using transformed directions
-    env_proj = sample_cubemap_gpu(cubemap.unsqueeze(0), vec_query)
-    
-    # Apply official flip
-    env_proj = torch.flip(env_proj, dims=[0, 1])
-    
-    return env_proj
-
-def get_ideal_ball(size: int, flip_x: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate ideal chrome ball reflection vectors"""
-    y, x = torch.meshgrid(
-        torch.linspace(-1, 1, size),
-        torch.linspace(-1, 1, size),
-        indexing='ij'
-    )
-    
-    if flip_x:
-        x = -x
-    
-    # Chrome ball geometry
-    r2 = x*x + y*y
-    mask = r2 <= 1.0
-    
-    # Normal vectors for chrome ball surface
-    z = torch.sqrt(torch.clamp(1.0 - r2, 0.0, 1.0))
-    normal = torch.stack([x, y, z], dim=-1)
-    
-    return normal, mask
 
 def get_ref_vector(normal: torch.Tensor, incoming_vector: np.ndarray) -> torch.Tensor:
     """Compute reflection vectors for chrome ball"""
@@ -423,40 +363,6 @@ def get_ref_vector(normal: torch.Tensor, incoming_vector: np.ndarray) -> torch.T
     
     return reflected
 
-def process_ball_envmap_official(cubemap: torch.Tensor, vec_ref: torch.Tensor,
-                               c2w: torch.Tensor, y_rot: torch.Tensor, 
-                               H: int, W: int) -> torch.Tensor:
-    """Chrome ball simulation for DiffusionLight compatibility"""
-    # Simulate chrome ball reflection vectors
-    vec_ball = -vec_ref.view(-1, 3) @ c2w[:3, :3].T
-    vec_query = (vec_ball @ y_rot[:3, :3].T).view(1, H, W, 3)
-    
-    # Sample cubemap using ball reflection directions
-    env_proj = sample_cubemap_gpu(cubemap.unsqueeze(0), vec_query)
-    
-    return env_proj
-
-def process_fixed_envmap_official(cubemap: torch.Tensor, vec: torch.Tensor, 
-                                H: int, W: int) -> torch.Tensor:
-    """Static environment without camera transformation"""
-    # Direct sampling without transformation
-    env_proj = sample_cubemap_gpu(cubemap.unsqueeze(0), -vec.unsqueeze(0))
-    env_proj = torch.flip(env_proj, dims=[0, 1])
-    return env_proj
-
-def create_neutral_environment(resolution: Tuple[int, int], 
-                             device: str = 'cuda') -> Dict[str, torch.Tensor]:
-    """Generate neutral gray environment as fallback"""
-    H, W = resolution
-    neutral_color = torch.tensor([0.5, 0.5, 0.5], device=device, dtype=torch.float32)
-    
-    env_ldr = neutral_color.view(1, 1, 1, 3).expand(1, H, W, 3)
-    env_log = neutral_color.view(1, 1, 1, 3).expand(1, H, W, 3)
-    
-    return {
-        'env_ldr': env_ldr,
-        'env_log': env_log,
-    }
 
 def process_environment_map_simplified(env_input: Union[str, torch.Tensor],
                                      format_type: str, resolution: Tuple[int, int],
@@ -498,62 +404,112 @@ def process_environment_map_simplified(env_input: Union[str, torch.Tensor],
         'env_ldr': env_ldr,
         'env_log': env_log,
     }
-
-def process_environment_map_official(env_input: Union[str, torch.Tensor],
-                                   format_type: str, resolution: Tuple[int, int],
-                                   env_brightness: float = 1.0, env_flip: bool = True,
-                                   env_rot: float = 180.0, device: str = 'cuda',
-                                   num_frames: int = 1, **kwargs) -> Dict[str, torch.Tensor]:
-    """
-    Official-quality environment map processing
-    
-    Args:
-        env_input: File path or tensor input
-        format_type: 'proj', 'ball', or 'fixed'
-        resolution: Target resolution (H, W)
-        env_brightness: HDR intensity multiplier
-        env_flip: Horizontal flip for correct orientation
-        env_rot: Rotation in degrees
-        device: Processing device
-        num_frames: Number of video frames
         
-    Returns:
-        Dictionary with processed environment maps
+def render_projection_from_panorama(
+    env_input: Union[str, torch.Tensor],
+    resolution: Tuple[int, int],
+    env_brightness: float = 1.0,
+    env_flip: bool = True,
+    env_rot: float = 180.0,
+    device: str = 'cuda',
+    num_frames: int = 1,
+    use_cache: bool = True, # Add this for control
+    **kwargs
+) -> Dict[str, torch.Tensor]:
     """
+    Takes a panoramic HDR and renders a perspective-correct projection from it.
+    This is the full "Panorama -> Cubemap -> Projected View" pipeline.
+    """
+    if use_cache:
+        # Generate a unique hash for the input tensor/path
+        if isinstance(env_input, torch.Tensor):
+            env_hash = compute_tensor_hash(env_input)
+        else:
+            env_hash = hashlib.md5(str(env_input).encode()).hexdigest()
+        
+        # Check the cache using all relevant parameters
+        cached_result = _env_cache.get(env_hash, resolution, 'proj', env_brightness, env_flip, env_rot)
+        if cached_result is not None:
+            logger.debug("Using cached panoramic projection ('proj')")
+            return cached_result
+
     H, W = resolution
     
-    # Load and preprocess to cubemap
+    # The rest of the function is the "cache miss" logic
     cubemap = load_and_preprocess_hdr_robust(env_input, env_brightness, env_flip, env_rot, device)
-    
-    # Generate direction vectors
     vec = latlong_vec((H, W), device=device)
-    
-    # Camera transformation (identity for now)
     c2w = torch.eye(4, device=device)
-    y_rot = rotate_y(0.0, device=device)  # No additional rotation
+    y_rot = rotate_y(0.0, device=device)
     
-    # Process based on format type
-    if format_type == 'proj':
-        env_proj = process_projected_envmap_official(cubemap, vec, c2w, y_rot, H, W)
-    elif format_type == 'ball':
-        # Generate chrome ball vectors
-        vec_ball, _ = get_ideal_ball(H, flip_x=False)
-        vec_ref = get_ref_vector(vec_ball, np.array([0, 0, 1]))
-        vec_ref = vec_ref.float().to(device)
-        env_proj = process_ball_envmap_official(cubemap, vec_ref, c2w, y_rot, H, W)
-    elif format_type == 'fixed':
-        env_proj = process_fixed_envmap_official(cubemap, vec, H, W)
-    else:
-        raise ValueError(f"Unsupported format type: {format_type}")
+    vec_cam = vec.view(-1, 3) @ c2w[:3, :3].T
+    vec_query = (vec_cam @ y_rot[:3, :3].T).view(1, H, W, 3)
+    env_proj = dr.texture(cubemap.unsqueeze(0), -vec_query.contiguous(),
+                          filter_mode='linear', boundary_mode='cube')[0]
+    env_proj = torch.flip(env_proj, dims=[0, 1])
     
-    # Apply official tone mapping
     mapping_results = hdr_mapping_official(env_proj, log_scale=10000.0)
     
-    # Use env_ev0 as env_ldr (official naming)
     env_ldr = mapping_results['env_ev0']
     env_log = mapping_results['env_log']
     
-    # Expand for video frames
+    if num_frames > 1:
+        env_ldr = env_ldr.unsqueeze(0).expand(num_frames, -1, -1, -1)
+        env_log = env_log.unsqueeze(0).expand(num_frames, -1, -1, -1)
+    else:
+        env_ldr = env_ldr.unsqueeze(0)
+        env_log = env_log.unsqueeze(0)
+        
+    result = {'env_ldr': env_ldr, 'env_log': env_log}
+    
+    if use_cache:
+        _env_cache.put(env_hash, resolution, 'proj', env_brightness, env_flip, env_rot, result)
+        
+    return result
+
+def tonemap_image_direct(
+    env_input: Union[str, torch.Tensor],
+    resolution: Tuple[int, int],
+    device: str = 'cuda',
+    num_frames: int = 1,
+    use_cache: bool = True, # Add this for control
+    **kwargs
+) -> Dict[str, torch.Tensor]:
+    """
+    Takes a pre-rendered HDR image (like a chrome ball) and applies tonemapping.
+    This is the "Direct to LDR/LOG" pipeline.
+    """
+    if use_cache:
+        if isinstance(env_input, torch.Tensor):
+            env_hash = compute_tensor_hash(env_input)
+        else:
+            env_hash = hashlib.md5(str(env_input).encode()).hexdigest()
+        
+        # Use dummy values for proj-specific params to maintain key structure
+        cached_result = _env_cache.get(env_hash, resolution, 'ball', 1.0, False, 0.0)
+        if cached_result is not None:
+            logger.debug("Using cached direct tonemap ('ball')")
+            return cached_result
+
+    H, W = resolution
+    
+    if isinstance(env_input, str):
+        env_proj = load_hdr_file(env_input).to(device)
+    elif isinstance(env_input, torch.Tensor):
+        env_proj = process_comfyui_tensor(env_input).to(device)
+    else:
+        raise ValueError(f"Unsupported input type: {type(env_input)}")
+    
+    if env_proj.shape[:2] != (H, W):
+        env_proj = torch.nn.functional.interpolate(
+            env_proj.permute(2, 0, 1).unsqueeze(0),
+            size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(0).permute(1, 2, 0)
+    
+    mapping_results = hdr_mapping_official(env_proj, log_scale=10000.0)
+    
+    env_ldr = mapping_results['env_ev0']
+    env_log = mapping_results['env_log']
+    
     if num_frames > 1:
         env_ldr = env_ldr.unsqueeze(0).expand(num_frames, -1, -1, -1)
         env_log = env_log.unsqueeze(0).expand(num_frames, -1, -1, -1)
@@ -561,77 +517,13 @@ def process_environment_map_official(env_input: Union[str, torch.Tensor],
         env_ldr = env_ldr.unsqueeze(0)
         env_log = env_log.unsqueeze(0)
     
-    return {
-        'env_ldr': env_ldr,
-        'env_log': env_log,
-    }
-
-def process_environment_map_robust(env_input: Union[str, torch.Tensor],
-                                 format_type: str = 'proj', 
-                                 resolution: Tuple[int, int] = (512, 512),
-                                 env_brightness: float = 1.0, env_flip: bool = True,
-                                 env_rot: float = 180.0, device: str = 'cuda',
-                                 use_cache: bool = True, **kwargs) -> Dict[str, torch.Tensor]:
-    """
-    Robust environment map processing with caching and fallbacks
+    result = {'env_ldr': env_ldr, 'env_log': env_log}
     
-    This is the main entry point for environment map processing.
-    """
-    # Generate cache key if using cache
     if use_cache:
-        if isinstance(env_input, torch.Tensor):
-            env_hash = compute_tensor_hash(env_input)
-        else:
-            env_hash = hashlib.md5(str(env_input).encode()).hexdigest()
+        # Use dummy values for proj-specific params to maintain key structure
+        _env_cache.put(env_hash, resolution, 'ball', 1.0, False, 0.0, result)
         
-        cached_result = _env_cache.get(env_hash, resolution, format_type, 
-                                      env_brightness, env_flip, env_rot)
-        if cached_result is not None:
-            logger.debug("Using cached environment map")
-            return cached_result
-    
-    # Try official implementation first
-    try:
-        result = process_environment_map_official(
-            env_input, format_type, resolution, env_brightness, 
-            env_flip, env_rot, device, **kwargs
-        )
-        
-        if use_cache:
-            _env_cache.put(env_hash, resolution, format_type, 
-                          env_brightness, env_flip, env_rot, result)
-        
-        return result
-        
-    except Exception as e:
-        logger.warning(f"Official processing failed: {e}, falling back to simplified")
-        
-        try:
-            # Fallback to simplified implementation
-            result = process_environment_map_simplified(
-                env_input, format_type, resolution, env_brightness,
-                env_flip, env_rot, device, **kwargs
-            )
-            return result
-            
-        except Exception as e2:
-            logger.error(f"All processing methods failed: {e2}, using neutral environment")
-            # Final fallback: neutral environment
-            return create_neutral_environment(resolution, device)
-
-# Legacy compatibility function
-def process_environment_map(env_map_path: str, resolution: Tuple[int, int], 
-                          num_frames: int, fixed_pose: bool, rotate_envlight: bool,
-                          env_format: List[str], device: str) -> Dict[str, torch.Tensor]:
-    """Legacy compatibility wrapper for existing code"""
-    format_type = env_format[0] if env_format else 'proj'
-    return process_environment_map_robust(
-        env_input=env_map_path,
-        format_type=format_type,
-        resolution=resolution,
-        device=device,
-        num_frames=num_frames
-    )
+    return result
 
 def clear_environment_cache():
     """Clear the global environment map cache"""

@@ -175,10 +175,13 @@ class CleanPatchEmbed(nn.Module):
         self.spatial_patch_size = spatial_patch_size
         self.temporal_patch_size = temporal_patch_size
         
-        # We define the linear projection layer directly here.
-        # The input dimension is the volume of a single patch.
         patch_dim = in_channels * (spatial_patch_size ** 2) * temporal_patch_size
-        self.proj = nn.Linear(patch_dim, out_channels, bias=bias)
+        
+        # Create an nn.ModuleDict to hold the linear layer under the key '1'.
+        # This will create the parameter name "proj.1.weight", exactly what the checkpoint has.
+        self.proj = nn.ModuleDict({
+            '1': nn.Linear(patch_dim, out_channels, bias=bias)
+        })
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -208,7 +211,7 @@ class CleanPatchEmbed(nn.Module):
         )
         
         # Apply the linear projection to the last dimension (the flattened patch).
-        embedded_patches = self.proj(patches)
+        embedded_patches = self.proj['1'](patches)
         
         return embedded_patches
 
@@ -561,7 +564,8 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         super().__init__(additional_concat_ch=additional_concat_ch, **kwargs)
         if self.use_context_embedding:
             self.context_embedding = nn.Embedding(num_embeddings=16, embedding_dim=kwargs["crossattn_emb_channels"])
-        def forward(self, x, timesteps, latent_condition, context_index, **kwargs):
+    
+    def forward(self, x, timesteps, latent_condition, context_index, **kwargs):
         
         # 1. Prepare Cross-Attention Embeddings from context_index
             if self.use_context_embedding:
@@ -570,8 +574,8 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
                    crossattn_emb = crossattn_emb.unsqueeze(1)
             else:
                # Create a dummy tensor if not using context embedding (e.g., for forward renderer)
-              B = x.shape[0]
-              crossattn_emb = torch.zeros(B, 1, self.context_embedding.embedding_dim, device=x.device, dtype=x.dtype)
+               crossattn_emb_channels = self.blocks['block0'].blocks[1].block.attn.to_k[0].in_features
+               crossattn_emb = torch.zeros(B, 1, crossattn_emb_channels, device=x.device, dtype=x.dtype)
 
          # 2. Call the parent class's forward method with all the prepared inputs
             return super().forward(
