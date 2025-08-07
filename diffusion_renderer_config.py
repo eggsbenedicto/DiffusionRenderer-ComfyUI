@@ -274,46 +274,33 @@ def get_config_by_model_type(
         raise ValueError(f"Unknown model type: {model_type}. Must be 'inverse' or 'forward'")
 
 
-def get_config_from_tensor_shape(
-    model_type: str,
-    tensor_shape: tuple
-) -> Dict[str, Any]:
-    """
-    Generate configuration dynamically from tensor shape.
-    
-    Args:
-        model_type: "inverse" or "forward"
-        tensor_shape: Shape of input tensor from ComfyUI
-                     4D: (B, H, W, C) - single image
-                     5D: (B, T, H, W, C) - video sequence
-                     Note: ComfyUI uses BTHWC format, not BCTHW!
-    
-    Returns:
-        Configuration dictionary with dimensions inferred from tensor
-    """
+def get_config_from_tensor_shape(model_type, tensor_shape):
     print(f"[Config] Generating config from tensor_shape: {tensor_shape}")
     
-    if len(tensor_shape) == 4:
-        # Single image from ComfyUI: (B, H, W, C) -> assume T=1
-        B, H, W, C = tensor_shape
-        T = 1
-        print(f"[Config] 4D tensor detected: B={B}, H={H}, W={W}, C={C}, T={T} (assumed)")
-    elif len(tensor_shape) == 5:
-        # Video sequence from ComfyUI: (B, T, H, W, C)
-        B, T, H, W, C = tensor_shape
-        print(f"[Config] 5D tensor detected: B={B}, T={T}, H={H}, W={W}, C={C}")
+    # --- THIS IS THE FIX ---
+    if len(tensor_shape) == 5:
+        B, C, T, H, W = tensor_shape
+        print(f"[Config] 5D tensor detected: B={B}, C={C}, T={T}, H={H}, W={W}")
     else:
-        raise ValueError(f"Unsupported tensor shape: {tensor_shape}. Expected 4D (B,H,W,C) or 5D (B,T,H,W,C) tensor from ComfyUI.")
+        raise ValueError(f"Expected a 5D tensor shape, but got {len(tensor_shape)} dimensions.")
+
+    # Now, use the correctly parsed dimensions
+    if model_type == 'inverse':
+        config = get_inverse_renderer_config(height=H, width=W, num_frames=T)
+    elif model_type == 'forward':
+        config = get_forward_renderer_config(height=H, width=W, num_frames=T)
+    else:
+        raise ValueError(f"Unknown model type for config generation: {model_type}")
+
+    # The rest of the logic inside get_..._config should correctly use these values
+    # to calculate the latent dimensions.
     
-    # Calculate latent dimensions for validation
-    latent_T = (T - 1) // 8 + 1 if T > 1 else 1
-    latent_H = H // 8
-    latent_W = W // 8
-    print(f"[Config] Calculated latent dimensions: T={latent_T}, H={latent_H}, W={latent_W}")
-    
-    # Use the appropriate config function with inferred dimensions
-    config = get_config_by_model_type(model_type, H, W, T)
-    print(f"[Config] Generated config for {model_type} model with latent_shape: {config['latent_shape']}")
+    # Example latent calculation from get_inverse_renderer_config:
+    # latent_t = 1 if num_frames == 1 else (num_frames - 1) // 8 + 1
+    # latent_h = H // 8
+    # latent_w = W // 8
+    # print(f"[Config] Calculated latent dimensions: T={latent_t}, H={latent_h}, W={latent_w}")
+    # config['latent_shape'] = [16, latent_t, latent_h, latent_w]
     
     return config
 
