@@ -6,3 +6,4 @@ opencv-python>=4.7.0
 einops>=0.6.0
 safetensors>=0.3.0
 typing-extensions>=4.0.0
+diffrp-nvdiffrast
