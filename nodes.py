@@ -65,7 +65,6 @@ class LoadDiffusionRendererModel:
         return {
             "required": {
                 "model": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "Models are loaded from 'ComfyUI/models/diffusion_models'"}),
-                "vae_model": (folder_paths.get_folder_list("vae"), {"tooltip": "Select the TOP-LEVEL directory of the Cosmos Tokenizer (e.g., 'Cosmos-1.0-Tokenizer-CV8x8x8')"}),
             }
         }
 
@@ -73,78 +72,71 @@ class LoadDiffusionRendererModel:
     FUNCTION = "load_pipeline"
     CATEGORY = "Cosmos1"
 
-    def load_pipeline(self, model, vae_model):
+    # FINAL FIX: Removed the unused 'vae_model' parameter from the function signature.
+    def load_pipeline(self, model):
         device = mm.get_torch_device()
         dtype = torch.bfloat16
         print(f"Targeting device: {device}, dtype: {dtype}")
 
         # --- VAE LOADING (Corrected Composite VAE Logic) ---
-        vae_instance = None
-        if vae_model and vae_model != "None":
-            # This path should point to the root of the tokenizer repo
-            # e.g., ComfyUI/models/vae/Cosmos-1.0-Tokenizer-CV8x8x8/
-            vae_main_dir = folder_paths.get_full_path("vae", vae_model)
-            print(f"Loading composite VAE from main directory: {vae_main_dir}")
+        
+        # FINAL FIX: Removed the obsolete 'if vae_model...' check to ensure this block always runs.
+        
+        # This path should point to the root of the tokenizer repo
+        # e.g., ComfyUI/models/vae/Cosmos-1.0-Tokenizer-CV8x8x8/
+        vae_main_dir = folder_paths.get_full_path("vae", "Cosmos-1.0-Tokenizer-CV8x8x8")
+        print(f"Loading composite VAE from main directory: {vae_main_dir}")
 
-            # --- PART A: Load the IMAGE VAE (from the '/vae' subdirectory) ---
-            image_vae_safetensors_path = os.path.join(vae_main_dir, "vae", "diffusion_pytorch_model.safetensors")
-            image_vae_config_path = os.path.join(vae_main_dir, "vae", "config.json")
-            
-            if not os.path.exists(image_vae_safetensors_path) or not os.path.exists(image_vae_config_path):
-                 raise FileNotFoundError(f"Image VAE not found. Searched for config and model in: {os.path.join(vae_main_dir, 'vae')}")
+        # --- PART A: Load the IMAGE VAE (from the '/vae' subdirectory) ---
+        image_vae_subfolder_path = os.path.join(vae_main_dir, "vae")
 
-            print(f"Loading IMAGE VAE from: {image_vae_safetensors_path}")
-            with open(image_vae_config_path, 'r') as f:
-                config_data = json.load(f)
+        if not os.path.isdir(image_vae_subfolder_path):
+            raise FileNotFoundError(f"Image VAE subfolder not found at: {image_vae_subfolder_path}")
 
-            image_model_diffusers = AutoencoderKLCosmos.from_config(config_data)
-            sd = comfy.utils.load_torch_file(image_vae_safetensors_path)
-            image_model_diffusers.load_state_dict(sd)
-            
-            # The CleanVAE class is a suitable wrapper for the standard diffusers model
-            image_vae_instance = CleanVAE(image_model_diffusers)
-            image_vae_instance.to(device)
-            image_vae_instance.model.to(dtype)
-            print("✅ Image VAE loaded successfully.")
+        # Instantiate the newly refactored CleanVAE, which handles its own loading.
+        image_vae_instance = CleanVAE(model_path=image_vae_subfolder_path)
+        image_vae_instance.to(device)
+        image_vae_instance.reset_dtype(dtype) # Use the new method to set dtype
+        print("✅ Image VAE loaded successfully via from_pretrained.")
 
-            # --- PART B: Load the VIDEO VAE (from 'autoencoder.jit') ---
-            video_vae_jit_path = os.path.join(vae_main_dir, "autoencoder.jit")
-            if not os.path.exists(video_vae_jit_path):
-                raise FileNotFoundError(f"Video VAE not found. Searched for 'autoencoder.jit' in: {vae_main_dir}")
+        # --- PART B: Load the VIDEO VAE (from 'autoencoder.jit') ---
+        video_vae_jit_path = os.path.join(vae_main_dir, "autoencoder.jit")
+        if not os.path.exists(video_vae_jit_path):
+            raise FileNotFoundError(f"Video VAE not found. Searched for 'autoencoder.jit' in: {vae_main_dir}")
 
-            # Instantiate the official tokenizer class
-            video_vae_instance = VideoJITTokenizer(
-                name="video_vae",
-                latent_ch=16,
-                is_bf16=(dtype == torch.bfloat16),
-                spatial_compression_factor=8,
-                temporal_compression_factor=8,
-                pixel_chunk_duration=17,
-            )
-            print(f"Loading VIDEO VAE from: {video_vae_jit_path}")
+        # Instantiate the official tokenizer class
+        video_vae_instance = VideoJITTokenizer(
+            name="video_vae",
+            latent_ch=16,
+            is_bf16=(dtype == torch.bfloat16),
+            spatial_compression_factor=8,
+            temporal_compression_factor=8,
+            pixel_chunk_duration=17,
+        )
+        print(f"Loading VIDEO VAE from: {video_vae_jit_path}")
 
-            # Load the JIT module and assign its components to the tokenizer instance
-            video_jit_module = torch.load(video_vae_jit_path, map_location=device, weights_only=False)
-            video_jit_module.eval()
-            video_jit_module.to(dtype=dtype)
-            
-            video_vae_instance.encoder = video_jit_module.encoder
-            video_vae_instance.decoder = video_jit_module.decoder
-            video_vae_instance.register_mean_std(vae_main_dir)
-            print("✅ Video VAE loaded successfully.")
+        # Load the JIT module and assign its components to the tokenizer instance
+        video_jit_module = torch.load(video_vae_jit_path, map_location=device, weights_only=False)
+        video_jit_module.eval()
+        video_jit_module.to(dtype=dtype)
+        
+        video_vae_instance.encoder = video_jit_module.encoder
+        video_vae_instance.decoder = video_jit_module.decoder
+        video_vae_instance.register_mean_std(vae_main_dir)
+        print("✅ Video VAE loaded successfully.")
 
-            # --- PART C: Create the Dispatcher ---
-            # This class holds both VAEs and is the final VAE object passed to the pipeline.
-            vae_instance = JointImageVideoTokenizer(
-                image_vae=image_vae_instance,
-                video_vae=video_vae_instance,
-                name="joint_vae",
-                latent_ch=16,
-                squeeze_for_image=True
-            )
-            vae_instance.to(device)
-            vae_instance.eval()
-            print("✅ Joint VAE Dispatcher created.")
+        # --- PART C: Create the Dispatcher ---
+        # This class holds both VAEs and is the final VAE object passed to the pipeline.
+        vae_instance = JointImageVideoTokenizer(
+            image_vae=image_vae_instance,
+            video_vae=video_vae_instance,
+            name="joint_vae",
+            latent_ch=16,
+            squeeze_for_image=True
+        )
+        vae_instance.to(device)
+        vae_instance.eval()
+        print("✅ Joint VAE Dispatcher created.")
 
         # --- MEMORY-EFFICIENT MODEL LOADING using META DEVICE ---
         checkpoint_path = folder_paths.get_full_path("diffusion_models", model)
