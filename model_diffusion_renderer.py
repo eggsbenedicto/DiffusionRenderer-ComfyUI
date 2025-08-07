@@ -355,33 +355,55 @@ class CleanDiffusionRendererModel(nn.Module):
                 raise
         
     def encode(self, x: Tensor) -> Tensor:
-        """VAE encode wrapper"""
-        print(f"[Model] encode input shape before VAE: {x.shape}")
+        """
+        VAE encode wrapper.
+        This is now a clean pass-through. The CleanVAE class is responsible
+        for all required dimension handling and permutation.
+        """
+        print(f"[Model] encode input shape, passing to VAE: {x.shape}")
+
+        # The input `x` from the pipeline is 5D: (B, C, T, H, W).
+        # We need to process each item in the batch individually for the VAE wrapper.
+        if x.ndim != 5:
+            raise ValueError(f"Model encode expects a 5D tensor (B,C,T,H,W), but got {x.ndim}D.")
+
+        # The CleanVAE expects a 4D tensor (T, C, H, W).
+        # We need to iterate over the batch and correctly shape the input for it.
+        # B, C, T, H, W -> permute to -> B, T, C, H, W -> iterate over B
         
-        # VAE expects 4D: (T, C, H, W), but model may pass 5D: (B, C, T, H, W)
-        if x.ndim == 5 and x.shape[0] == 1:
-            x = x.squeeze(0)  # (C, T, H, W)
-            print(f"[Model] after squeeze batch: {x.shape}")
+        x_permuted = x.permute(0, 2, 1, 3, 4) # (B, T, C, H, W)
         
-        # VAE expects (T, C, H, W), but we might have (C, T, H, W)
-        if x.shape[0] == self.vae.latent_ch or (x.shape[0] == 3 and x.shape[1] > 3):
-            x = x.permute(1, 0, 2, 3)  # (T, C, H, W)
-            print(f"[Model] after permute for VAE: {x.shape}")
+        encoded_list = [self.vae.encode(item) for item in x_permuted]
         
-        latent = self.vae.encode(x)
-        print(f"[Model] VAE encode output shape: {latent.shape}")
+        # Stack the results back into a single tensor.
+        # The VAE output is (latent_ch, T_compressed, H_latent, W_latent).
+        # Stacking creates (B, latent_ch, T_compressed, H_latent, W_latent).
+        latent = torch.stack(encoded_list, dim=0)
+
+        print(f"[Model] VAE encode final output shape: {latent.shape}")
         return latent
-        
+
     def decode(self, x: Tensor) -> Tensor:
-        """VAE decode wrapper"""
-        print(f"[Model] decode input latent shape: {x.shape}")
-        decoded = self.vae.decode(x)
-        print(f"[Model] VAE decode output shape: {decoded.shape}")
+        """
+        VAE decode wrapper. This also becomes a clean pass-through.
+        """
+        print(f"[Model] decode input latent shape, passing to VAE: {x.shape}")
         
-        # Ensure output is properly shaped for downstream processing
-        if decoded.ndim == 4:
-            print(f"[Model] VAE output is 4D (T,C,H,W), keeping as is")
-        
+        # Input `x` from diffusion is 5D: (B, latent_ch, T_comp, H_l, W_l).
+        # The CleanVAE expects a 4D tensor (latent_ch, T_comp, H_l, W_l).
+        if x.ndim != 5:
+             raise ValueError(f"Model decode expects a 5D latent (B,C,T,H,W), but got {x.ndim}D.")
+
+        decoded_list = [self.vae.decode(item) for item in x]
+
+        # Stack the results. VAE output is (T, C, H, W).
+        # Stacking creates (B, T, C, H, W).
+        decoded_stacked = torch.stack(decoded_list, dim=0)
+
+        # Permute back to the pipeline's expected (B, C, T, H, W) format.
+        decoded = decoded_stacked.permute(0, 2, 1, 3, 4)
+
+        print(f"[Model] VAE decode final output shape: {decoded.shape}")
         return decoded
         
     def prepare_diffusion_renderer_latent_conditions(

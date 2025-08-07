@@ -573,6 +573,7 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
                if crossattn_emb.ndim == 2:
                    crossattn_emb = crossattn_emb.unsqueeze(1)
             else:
+               B = x.shape[0]
                # Create a dummy tensor if not using context embedding (e.g., for forward renderer)
                crossattn_emb_channels = self.blocks['block0'].blocks[1].block.attn.to_k[0].in_features
                crossattn_emb = torch.zeros(B, 1, crossattn_emb_channels, device=x.device, dtype=x.dtype)
