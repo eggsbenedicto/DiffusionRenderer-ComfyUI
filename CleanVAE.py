@@ -2,11 +2,14 @@ import torch
 from typing import Tuple
 from diffusers import AutoencoderKLCosmos
 
+import torch
+from typing import Tuple
+from diffusers import AutoencoderKLCosmos
+
 class CleanVAE:
     """
     A pure 4D wrapper for the diffusers AutoencoderKLCosmos for single-frame encoding/decoding.
     It accepts and returns standard 4D (B, C, H, W) tensors.
-    The JointImageVideoTokenizer is responsible for managing the time dimension.
     """
     
     def __init__(self, model_path: str):
@@ -25,10 +28,9 @@ class CleanVAE:
         print(f"  - Latent channels: {self.latent_ch}")
         print(f"  - Spatial compression: {self.spatial_compression_factor}x")
 
-    # Property for compatibility with the Joint Tokenizer interface
     @property
     def temporal_compression_factor(self):
-        return 1 # An image VAE has no temporal compression.
+        return 1
 
     def get_latent_num_frames(self, num_pixel_frames: int) -> int:
         return 1
@@ -37,23 +39,21 @@ class CleanVAE:
         return 1
     
     @torch.no_grad()
-    def encode(self, state: torch.Tensor) -> torch.Tensor:
-        """ Encodes a 4D (B,C,H,W) tensor. """
-        if state.ndim != 4:
-            raise ValueError(f"CleanVAE (Image VAE) expects a 4D input (B, C, H, W), but got {state.shape}")
+    def encode(self, state_4d: torch.Tensor) -> torch.Tensor:
+        """ Encodes a 4D (B, C, H, W) tensor. """
+        if state_4d.ndim != 4:
+            raise ValueError(f"CleanVAE (Image VAE) expects a 4D input (B, C, H, W), but got {state_4d.shape}")
         
-        # Pass directly to the diffusers model
-        encoded = self.model.encode(state)
+        encoded = self.model.encode(state_4d)
         return encoded.latent_dist.sample()
     
     @torch.no_grad()
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """ Decodes a 4D (B,C,H,W) latent tensor. """
-        if latent.ndim != 4:
-            raise ValueError(f"CleanVAE (Image VAE) expects a 4D latent (B, C, H, W), but got {latent.shape}")
+    def decode(self, latent_4d: torch.Tensor) -> torch.Tensor:
+        """ Decodes a 4D (B, C, H, W) latent tensor. """
+        if latent_4d.ndim != 4:
+            raise ValueError(f"CleanVAE (Image VAE) expects a 4D latent (B, C, H, W), but got {latent_4d.shape}")
 
-        # Pass directly to the diffusers model
-        decoded = self.model.decode(latent)
+        decoded = self.model.decode(latent_4d)
         return decoded.sample
     
     def to(self, device):
