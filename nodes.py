@@ -72,73 +72,27 @@ class LoadDiffusionRendererModel:
     FUNCTION = "load_pipeline"
     CATEGORY = "Cosmos1"
 
-    # FINAL FIX: Removed the unused 'vae_model' parameter from the function signature.
     def load_pipeline(self, model):
         device = mm.get_torch_device()
         dtype = torch.bfloat16
         print(f"Targeting device: {device}, dtype: {dtype}")
 
-        # --- VAE LOADING (Corrected Composite VAE Logic) ---
-        
-        # FINAL FIX: Removed the obsolete 'if vae_model...' check to ensure this block always runs.
-        
-        # This path should point to the root of the tokenizer repo
-        # e.g., ComfyUI/models/vae/Cosmos-1.0-Tokenizer-CV8x8x8/
+        # --- VAE LOADING (Simplified and Corrected) ---
         vae_main_dir = os.path.join(folder_paths.models_dir, "vae", "Cosmos-1.0-Tokenizer-CV8x8x8")
-        print(f"Loading composite VAE from main directory: {vae_main_dir}")
-
-        # --- PART A: Load the IMAGE VAE (from the '/vae' subdirectory) ---
+        if not vae_main_dir:
+             raise FileNotFoundError("Could not find 'Cosmos-1.0-Tokenizer-CV8x8x8' in any VAE model directory.")
+        
         image_vae_subfolder_path = os.path.join(vae_main_dir, "vae")
-
         if not os.path.isdir(image_vae_subfolder_path):
             raise FileNotFoundError(f"Image VAE subfolder not found at: {image_vae_subfolder_path}")
 
-        # Instantiate the newly refactored CleanVAE, which handles its own loading.
-        image_vae_instance = CleanVAE(model_path=image_vae_subfolder_path)
-        image_vae_instance.to(device)
-        image_vae_instance.reset_dtype(dtype) # Use the new method to set dtype
-        print("✅ Image VAE loaded successfully via from_pretrained.")
-
-        # --- PART B: Load the VIDEO VAE (from 'autoencoder.jit') ---
-        video_vae_jit_path = os.path.join(vae_main_dir, "autoencoder.jit")
-        if not os.path.exists(video_vae_jit_path):
-            raise FileNotFoundError(f"Video VAE not found. Searched for 'autoencoder.jit' in: {vae_main_dir}")
-
-        # Instantiate the official tokenizer class
-        video_vae_instance = VideoJITTokenizer(
-            name="video_vae",
-            latent_ch=16,
-            is_bf16=(dtype == torch.bfloat16),
-            spatial_compression_factor=8,
-            temporal_compression_factor=8,
-            pixel_chunk_duration=17,
-        )
-        print(f"Loading VIDEO VAE from: {video_vae_jit_path}")
-
-        # Load the JIT module and assign its components to the tokenizer instance
-        video_jit_module = torch.load(video_vae_jit_path, map_location=device, weights_only=False)
-        video_jit_module.eval()
-        video_jit_module.to(dtype=dtype)
-        
-        video_vae_instance.encoder = video_jit_module.encoder
-        video_vae_instance.decoder = video_jit_module.decoder
-        video_vae_instance.register_mean_std(vae_main_dir)
-        print("✅ Video VAE loaded successfully.")
-
-        # --- PART C: Create the Dispatcher ---
-        # This class holds both VAEs and is the final VAE object passed to the pipeline.
-        vae_instance = JointImageVideoTokenizer(
-            image_vae=image_vae_instance,
-            video_vae=video_vae_instance,
-            name="joint_vae",
-            latent_ch=16,
-            squeeze_for_image=True
-        )
+        # We load one VAE and wrap it. This VAE handles both images (T=1) and videos.
+        vae_instance = CleanVAE(model_path=image_vae_subfolder_path)
         vae_instance.to(device)
-        vae_instance.eval()
-        print("✅ Joint VAE Dispatcher created.")
+        vae_instance.reset_dtype(dtype)
+        print("✅ Universal VAE loaded successfully via from_pretrained.")
 
-        # --- MEMORY-EFFICIENT MODEL LOADING using META DEVICE ---
+        # --- MEMORY-EFFICIENT MODEL LOADING ---
         checkpoint_path = folder_paths.get_full_path("diffusion_models", model)
         
         print(f"Loading checkpoint weights to CPU from: {checkpoint_path}")
@@ -152,11 +106,8 @@ class LoadDiffusionRendererModel:
         with torch.device("meta"):
              model_instance = CleanDiffusionRendererModel(basic_config)
 
-        print(f"Materializing model on {device} (step 1/2)...")
         model_instance.to_empty(device=device)
-        print(f"Casting materialized model to {dtype} (step 2/2)...")
         model_instance.to(dtype=dtype)
-        print("Loading weights into the full materialized GPU model...")
         model_instance.load_state_dict(state_dict, strict=True)
         
         del state_dict
@@ -168,7 +119,7 @@ class LoadDiffusionRendererModel:
             checkpoint_dir=os.path.dirname(checkpoint_path),
             checkpoint_name=os.path.basename(checkpoint_path),
             model_type=None,
-            vae_instance=vae_instance, # Pass the joint tokenizer dispatcher
+            vae_instance=vae_instance,
             model_instance=model_instance,
             guidance=0.0,
             num_steps=15,

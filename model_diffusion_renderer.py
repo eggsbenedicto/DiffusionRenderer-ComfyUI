@@ -56,7 +56,7 @@ class CleanEDMEulerScheduler:
             log_sigmas = torch.log(sigmas)
             
             # Select 'num_steps' sigmas from the full training schedule
-            indices = torch.linspace(0, self.num_train_timesteps - 1, num_steps, device=device).long()
+            indices = torch.linspace(0, self.num_train_timesteps - 1, num_steps).long()
             final_sigmas = sigmas[indices].to(device=device, dtype=torch.float32)
 
         else: # Fallback to the original log-linear schedule

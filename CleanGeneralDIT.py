@@ -451,6 +451,8 @@ class CleanGeneralDIT(nn.Module):
         affline_emb_norm = kwargs.get('affline_emb_norm', True)
         self.additional_concat_ch = kwargs.get('additional_concat_ch', 0)
         self._patch_embed_bias = getattr(self, '_patch_embed_bias', True)
+        self.concat_padding_mask = kwargs.get('concat_padding_mask', True)
+        self._patch_embed_bias = getattr(self, '_patch_embed_bias', True)
 
         self.patch_spatial = kwargs['patch_spatial']
         self.patch_temporal = kwargs['patch_temporal']
@@ -506,11 +508,18 @@ class CleanGeneralDIT(nn.Module):
         'crossattn_emb' is for text or other guidance (like context_index).
         """
         # 1. Prepare Timestep Embeddings
+        timesteps = timesteps.to(x.dtype)
         t_emb, adaln_lora_emb = self.t_embedder(timesteps.flatten())
         affline_emb = self.affline_norm(t_emb)
 
-        # 2. Concatenate input `x` with the condition
-        x_conditioned = torch.cat([x, latent_condition], dim=1)
+        # 2. Concatenate input `x` with the condition and padding mask if needed.
+        tensors_to_cat = [x, latent_condition]
+        
+        if self.concat_padding_mask:
+            padding_mask = torch.ones(x.shape[0], 1, *x.shape[2:], device=x.device, dtype=x.dtype)
+            tensors_to_cat.append(padding_mask)
+
+        x_conditioned = torch.cat(tensors_to_cat, dim=1)
         
         # 3. Patch Embeddings
         x_patches = self.x_embedder(x_conditioned)

@@ -23,5 +23,5 @@ Currently I have only tested on Ubuntu. Information online indicates that instal
 
 You'll want to download the official Diffusion Renderer checkpoints into your diffusion_models directory in ComfyUI. They can be found here: https://huggingface.co/collections/zianw/cosmos-diffusionrenderer-6849f2a4da267e55409b8125 
 
-You'll also want to download Nvidia's Video Tokenizers to your vae directory in ComfyUI. Make sure this entire repo is in your vae subfolder with the name "Cosmos-1.0-Tokenizer-CV8x8x8". This is the natural expected result if you download the repo using 'hf download nvidia/Cosmos-1.0-Tokenizer-CV8x8x8 --local-dir vae' from your ComfyUI/models directory
+You'll also want to download Nvidia's Video Tokenizers to your vae directory in ComfyUI. Make sure this entire repo is in your vae subfolder with the name "Cosmos-1.0-Tokenizer-CV8x8x8". This is the natural expected result if you download the repo using 'hf download nvidia/Cosmos-1.0-Tokenizer-CV8x8x8 --local-dir Cosmos-1.0-Tokenizer-CV8x8x8' from your ComfyUI/models/vae directory. [EDIT: You can delete the JIT tokenizers. They are currently unused. Keep the remaining file structure the same.]
 
