@@ -41,7 +41,8 @@ class CleanDiffusionRendererPipeline:
                  model_instance = None,  # Pre-loaded CleanDiffusionRendererModel instance
                  guidance: float = 2.0, num_steps: int = 20, 
                  height: int = 1024, width: int = 1024, 
-                 num_video_frames: int = 1, seed: int = 42):
+                 num_video_frames: int = 1, seed: int = 42,
+                 dtype: torch.dtype = torch.bfloat16):
         """
         Clean Diffusion Renderer Pipeline with dynamic configuration
         
@@ -78,7 +79,7 @@ class CleanDiffusionRendererPipeline:
         
         # Device/precision settings
         self.device = torch.device('cuda')
-        self.dtype = torch.bfloat16
+        self.dtype = dtype
         
         # Configuration will be generated dynamically based on input
         self.config = None

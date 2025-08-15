@@ -14,9 +14,8 @@ from comfy.utils import ProgressBar
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
-# --- Corrected/New Imports ---
 from diffusers import AutoencoderKLCosmos
-from .CleanVAE import CleanVAE # Used as a simple wrapper for the Image VAE
+from .CleanVAE import CleanVAE
 from .pretrained_vae import VideoJITTokenizer, JointImageVideoTokenizer
 
 from .diffusion_renderer_pipeline import CleanDiffusionRendererPipeline
@@ -206,7 +205,11 @@ class Cosmos1InverseRenderer:
             )
             
             output_tensor = torch.from_numpy(output_array).float() / 255.0
-            outputs[gbuffer_pass] = output_tensor
+
+            b, t, h, w, c = output_tensor.shape
+            output_tensor_4d = output_tensor.reshape(b * t, h, w, c)
+
+            outputs[gbuffer_pass] = output_tensor_4d
             pbar.update(1)
 
         return (outputs["basecolor"], outputs["metallic"], outputs["roughness"], outputs["normal"], outputs["depth"])

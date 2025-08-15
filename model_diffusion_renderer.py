@@ -14,87 +14,72 @@ class FourierFeaturesPlaceholder(nn.Module):
     def forward(self, x): return x
 
 class CleanEDMEulerScheduler:
-    """
-    An intelligent EDM-style scheduler that can initialize its sigma schedule
-    from a beta-based (DDPM/LDM) configuration.
-    """
-    def __init__(self, sigma_max: float = 80.0, sigma_min: float = 0.02, sigma_data: float = 0.5,
-                 beta_start: float = 0.00085, beta_end: float = 0.012, beta_schedule: str = "scaled_linear",
-                 num_train_timesteps: int = 1000, **kwargs):
-        # Store all parameters, including beta-related ones.
+    def __init__(self, sigma_max=80.0, sigma_min=0.02, sigma_data=0.5, **kwargs):
         self.sigma_max = sigma_max
         self.sigma_min = sigma_min
         self.sigma_data = sigma_data
-        self.beta_start = beta_start
-        self.beta_end = beta_end
-        self.beta_schedule = beta_schedule
-        self.num_train_timesteps = num_train_timesteps
+        self.sigmas, self.timesteps, self.current_step = None, None, 0
         
-        # This will hold the final sigmas for sampling.
-        self.sigmas = None
-        self.timesteps = None
-        self.current_step = 0
-        
-    def set_timesteps(self, num_steps: int, device: Optional[torch.device] = None):
-        """
-        Calculates the sigma schedule. If beta schedule is 'scaled_linear',
-        it computes sigmas from betas. Otherwise, it uses a log-linear schedule.
-        """
-        if self.beta_schedule == "scaled_linear":
-            # Generate betas
-            betas = torch.linspace(self.beta_start**0.5, self.beta_end**0.5, self.num_train_timesteps, dtype=torch.float32) ** 2
-            
-            # Calculate alphas and cumulative alphas
-            alphas = 1.0 - betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            
-            # Calculate sigmas from alphas_cumprod (EDM formula)
-            sigmas = ((1 - alphas_cumprod) / alphas_cumprod) ** 0.5
-            
-            # Invert and select a subset for inference
-            sigmas = torch.flip(sigmas, [0])
-            log_sigmas = torch.log(sigmas)
-            
-            # Select 'num_steps' sigmas from the full training schedule
-            indices = torch.linspace(0, self.num_train_timesteps - 1, num_steps).long()
-            final_sigmas = sigmas[indices].to(device=device, dtype=torch.float32)
-
-        else: # Fallback to the original log-linear schedule
-            final_sigmas = torch.logspace(np.log10(self.sigma_max), np.log10(self.sigma_min), num_steps, device=device)
-        
-        # Add sigma=0 for the final denoising step
-        self.sigmas = torch.cat([final_sigmas, torch.tensor([0.0], device=device)])
+    def set_timesteps(self, num_steps, device=None):
+        # Timesteps should be calculated in float32
+        sigmas = torch.logspace(np.log10(self.sigma_max), np.log10(self.sigma_min), num_steps, device=device, dtype=torch.float32)
+        self.sigmas = torch.cat([sigmas, torch.tensor([0.0], device=device, dtype=torch.float32)])
         self.timesteps = self.sigmas[:-1]
         self.current_step = 0
         
-    def scale_model_input(self, sample: Tensor, timestep: Tensor) -> Tensor:
-        sigma = timestep
-        c_in = 1 / torch.sqrt(sigma**2 + self.sigma_data**2)
-        return sample * c_in
+    def scale_model_input(self, sample, timestep):
+        # --- FIX: Perform calculations in float32 for numerical stability ---
+        # Store original dtype
+        orig_dtype = sample.dtype
         
-    def step(self, model_output: Tensor, timestep: Tensor, sample: Tensor, use_heun: bool = False):
+        # Convert inputs to float32
+        sample_fp32 = sample.to(torch.float32)
+        timestep_fp32 = timestep.to(torch.float32)
+        
+        # Calculate c_in using float32
+        c_in = 1 / torch.sqrt(timestep_fp32**2 + self.sigma_data**2)
+        scaled_sample = sample_fp32 * c_in
+        
+        # Cast back to the original dtype before returning
+        return scaled_sample.to(orig_dtype)
+        
+    def step(self, model_output, timestep, sample):
         if self.sigmas is None or self.current_step >= len(self.sigmas) - 1:
-            raise RuntimeError("Scheduler not properly initialized or step counter out of bounds")
+            raise RuntimeError("Scheduler not initialized or timesteps exhausted")
         
-        sigma_curr = self.sigmas[self.current_step]
+        # --- FIX: Perform all intermediate calculations in float32 ---
+        # Store original dtype
+        orig_dtype = sample.dtype
+        
+        # Convert all inputs to float32
+        model_output_fp32 = model_output.to(torch.float32)
+        timestep_fp32 = timestep.to(torch.float32)
+        sample_fp32 = sample.to(torch.float32)
+        
+        # Define current and next sigma in float32
+        sigma = timestep_fp32
         sigma_next = self.sigmas[self.current_step + 1]
+
+        # Calculate preconditioning constants in float32
+        sigma_data = self.sigma_data
+        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+        c_out = (sigma * sigma_data) / torch.sqrt(sigma**2 + sigma_data**2)
+
+        # Predict the denoised sample in float32
+        denoised = c_skip * sample_fp32 + c_out * model_output_fp32
         
-        c_out = sigma_curr * self.sigma_data / torch.sqrt(sigma_curr**2 + self.sigma_data**2)
-        c_skip = self.sigma_data**2 / (sigma_curr**2 + self.sigma_data**2)
-        
-        denoised = c_skip * sample + c_out * model_output
-        
-        if sigma_next == 0:
-            prev_sample = denoised
-        else:
-            derivative = (denoised - sample) / sigma_curr
-            prev_sample = sample + (sigma_next - sigma_curr) * derivative
+        # Perform the Euler step in float32
+        derivative = (sample_fp32 - denoised) / sigma
+        dt = sigma_next - sigma
+        prev_sample = sample_fp32 + derivative * dt
         
         self.current_step += 1
         
+        # Return the result in the expected class format, cast back to the original dtype
         class StepResult:
             def __init__(self, prev_sample): self.prev_sample = prev_sample
-        return StepResult(prev_sample)
+            
+        return StepResult(prev_sample.to(orig_dtype))
 
 class CleanCondition:
     def __init__(self, **kwargs): self.data = kwargs
@@ -119,8 +104,9 @@ class CleanDiffusionRendererModel(nn.Module):
         self.config = config
         net_config = config.get('net', {})
         scheduler_config = config.get('scheduler', {})
+
+        scheduler_config.pop('prediction_type', None)
         
-        # The new scheduler now accepts all keys, so no popping is needed.
         self.scheduler = CleanEDMEulerScheduler(**scheduler_config)
         self.conditioner = CleanConditioner()
         self.net = CleanDiffusionRendererGeneralDIT(**net_config)
@@ -150,14 +136,24 @@ class CleanDiffusionRendererModel(nn.Module):
             return {"device": torch.device("cuda"), "dtype": torch.bfloat16}
     
     def encode(self, x: Tensor) -> Tensor:
+        """
+        VAE encode pass-through, now with correct EDM scaling.
+        """
         if self.vae is None: raise RuntimeError("VAE not initialized in model.")
         if x.ndim != 5: raise ValueError(f"Model encode expects a 5D tensor (B,C,T,H,W), but got {x.ndim}D.")
-        return self.vae.encode(x)
+        
+        # Encode and then scale by sigma_data, as done in the official implementation.
+        return self.vae.encode(x) * self.scheduler.sigma_data
         
     def decode(self, x: Tensor) -> Tensor:
+        """
+        VAE decode pass-through, now with correct EDM scaling.
+        """
         if self.vae is None: raise RuntimeError("VAE not initialized in model.")
         if x.ndim != 5: raise ValueError(f"Model decode expects a 5D latent (B,C,T,H,W), but got {x.ndim}D.")
-        return self.vae.decode(x)
+        
+        # Scale by 1/sigma_data before decoding, as done in the official implementation.
+        return self.vae.decode(x / self.scheduler.sigma_data)
         
     def prepare_diffusion_renderer_latent_conditions(
         self, data_batch: Dict[str, Tensor], condition_keys: list = None, **kwargs
