@@ -161,7 +161,7 @@ def get_inverse_renderer_config(
         # Condition handling - Inverse takes RGB input
         "condition_keys": ["rgb"],
         "condition_drop_rate": 0.1,
-        "append_condition_mask": False,
+        "append_condition_mask": True,
         
         # Network architecture
         "net": {

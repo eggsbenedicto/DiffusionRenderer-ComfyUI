@@ -140,49 +140,70 @@ class SinCosPosEmbAxis(nn.Module):
 # ===================== ROPE IMPLEMENTATION =====================
 def apply_rotary_pos_emb_pure_torch(x: torch.Tensor, freqs: torch.Tensor, tensor_format: str = "sbhd", fused: bool = True):
     """
-    Apply rotary position embeddings to input tensor.
+    Apply rotary position embeddings matching transformer_engine's implementation.
     
-    CRITICAL: The official transformer_engine version expects raw frequencies,
-    not pre-computed sin/cos values. This is a key difference!
+    Based on: https://github.com/NVIDIA/TransformerEngine/blob/main/transformer_engine/pytorch/attention.py
     
     Args:
-        x: Input tensor in format specified by tensor_format
-        freqs: Raw frequency values (not sin/cos), shape should broadcast with x
-        tensor_format: Format string for input tensor
-        fused: Whether to use fused implementation
+        x: Input tensor with shape determined by tensor_format
+        freqs: Raw frequency values (not sin/cos!) with shape (seq_len, 1, 1, dim)
+        tensor_format: Format string, we use "sbhd" (seq, batch, heads, dim)
+        fused: Whether to use fused implementation (always True for us)
     """
-    # Ensure freqs are on the same device and dtype as x
+    if tensor_format != "sbhd":
+        raise NotImplementedError(f"Only 'sbhd' format is implemented, got {tensor_format}")
+    
+    # x shape: (S, B, H, D)
+    # freqs shape: (S, 1, 1, D)
+    
+    seq_len, batch, heads, dim = x.shape
     device = x.device
     dtype = x.dtype
     
-    if tensor_format == "sbhd":
-        # x shape: (S, B, H, D)
-        # freqs shape: (S, 1, 1, D) 
-        seq_len, batch, heads, dim = x.shape
-        
-        # freqs contains raw frequencies, need to compute sin/cos
-        freqs = freqs.squeeze(1).squeeze(1)  # (S, D)
-        
-        # Expand frequencies to match x dimensions
-        freqs = freqs.unsqueeze(1).unsqueeze(1).expand(seq_len, batch, heads, dim)
-        
-        # Split x into two halves for rotation
-        x_r, x_i = x.chunk(2, dim=-1)
-        
-        # Apply rotation using angle (frequency * position is already in freqs)
-        cos_freqs = freqs[..., :dim//2].cos().to(dtype)
-        sin_freqs = freqs[..., :dim//2].sin().to(dtype)
-        
-        # Apply rotation formula: (x_r + i*x_i) * (cos + i*sin)
-        out_r = x_r * cos_freqs - x_i * sin_freqs
-        out_i = x_r * sin_freqs + x_i * cos_freqs
-        
-        # Concatenate back
-        return torch.cat([out_r, out_i], dim=-1)
-    else:
-        raise NotImplementedError(f"Tensor format {tensor_format} not implemented")
+    # Ensure freqs are on the right device/dtype
+    freqs = freqs.to(device=device, dtype=torch.float32)  # Use float32 for stability
+    
+    # The frequencies contain raw angle values, not sin/cos
+    # TransformerEngine expects the last dimension to be the full dimension
+    # but only uses half for the actual frequencies
+    
+    # Extract the actual frequencies (first half of the last dimension)
+    freqs = freqs.squeeze(1).squeeze(1)  # (S, D)
+    freqs_for_cos_sin = freqs[..., :dim // 2]  # (S, D/2)
+    
+    # Compute cos and sin
+    cos = freqs_for_cos_sin.cos()  # (S, D/2)
+    sin = freqs_for_cos_sin.sin()  # (S, D/2)
+    
+    # Expand to match input dimensions
+    cos = cos.unsqueeze(1).unsqueeze(1)  # (S, 1, 1, D/2)
+    sin = sin.unsqueeze(1).unsqueeze(1)  # (S, 1, 1, D/2)
+    
+    # Convert to input dtype for computation
+    cos = cos.to(dtype)
+    sin = sin.to(dtype)
+    
+    # Split input into two halves for rotation
+    # This is the "interleaved" format that transformer_engine uses
+    x1, x2 = x.chunk(2, dim=-1)  # Each is (S, B, H, D/2)
+    
+    # Apply rotation using the formula from transformer_engine:
+    # [x1, x2] * [cos, sin] = [x1*cos - x2*sin, x1*sin + x2*cos]
+    # This is equivalent to complex multiplication: (x1 + ix2) * (cos + isin)
+    
+    # Rotate
+    x_rotated = torch.cat([
+        x1 * cos - x2 * sin,
+        x1 * sin + x2 * cos
+    ], dim=-1)
+    
+    return x_rotated
 
 class CleanRoPE3D(nn.Module):
+    """
+    RoPE 3D implementation that matches the official VideoRopePosition3DEmb
+    but returns frequencies compatible with transformer_engine's apply_rotary_pos_emb
+    """
     def __init__(self, head_dim: int, 
                  h_extrapolation_ratio: float = 1.0,
                  w_extrapolation_ratio: float = 1.0,
@@ -190,7 +211,6 @@ class CleanRoPE3D(nn.Module):
                  **kwargs):
         super().__init__()
         self.head_dim = head_dim
-        # Keep buffer for checkpoint compatibility
         self.register_buffer("seq", torch.arange(128, dtype=torch.float))
         
         # Split dimensions EXACTLY like official
@@ -198,25 +218,30 @@ class CleanRoPE3D(nn.Module):
         dim_h = dim // 6 * 2
         dim_w = dim_h  
         dim_t = dim - 2 * dim_h
-        assert dim == dim_h + dim_w + dim_t
+        assert dim == dim_h + dim_w + dim_t, f"Dimension split error: {dim} != {dim_h} + {dim_w} + {dim_t}"
         
         self.dim_h = dim_h
         self.dim_w = dim_w
         self.dim_t = dim_t
         
-        # CRITICAL: Create frequency ranges - no cuda() here, will move to device later
+        # Create frequency ranges (matching official implementation)
         dim_spatial_range = torch.arange(0, dim_h, 2)[:dim_h//2].float() / dim_h
         dim_temporal_range = torch.arange(0, dim_t, 2)[:dim_t//2].float() / dim_t
         
         self.register_buffer("dim_spatial_range", dim_spatial_range, persistent=False)
         self.register_buffer("dim_temporal_range", dim_temporal_range, persistent=False)
         
-        # Calculate NTK factors EXACTLY like official
+        # Calculate NTK factors exactly like official
         self.h_ntk_factor = h_extrapolation_ratio ** (dim_h / (dim_h - 2)) if dim_h > 2 else h_extrapolation_ratio
         self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2)) if dim_w > 2 else w_extrapolation_ratio
         self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2)) if dim_t > 2 else t_extrapolation_ratio
 
     def forward(self, x_patches: torch.Tensor, fps=None):
+        """
+        Generate RoPE embeddings compatible with transformer_engine's apply_rotary_pos_emb.
+        
+        Returns raw frequencies (angles), NOT sin/cos values.
+        """
         B, T_p, H_p, W_p, D_model = x_patches.shape
         device = x_patches.device
         dtype = x_patches.dtype
@@ -227,12 +252,12 @@ class CleanRoPE3D(nn.Module):
             self.dim_temporal_range = self.dim_temporal_range.to(device)
             self.seq = self.seq.to(device)
         
-        # Compute theta values with NTK scaling
+        # Compute theta values with NTK scaling (exactly like official)
         h_theta = 10000.0 * self.h_ntk_factor
         w_theta = 10000.0 * self.w_ntk_factor  
         t_theta = 10000.0 * self.t_ntk_factor
         
-        # Compute frequencies
+        # Compute inverse frequencies
         h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range)
         w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range)
         temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range)
@@ -242,23 +267,32 @@ class CleanRoPE3D(nn.Module):
         seq_h = self.seq[:H_p] if H_p <= len(self.seq) else torch.arange(H_p, device=device, dtype=torch.float)
         seq_w = self.seq[:W_p] if W_p <= len(self.seq) else torch.arange(W_p, device=device, dtype=torch.float)
         
-        # Compute outer products for half embeddings (frequencies only, not sin/cos yet)
-        half_emb_t = torch.outer(seq_t, temporal_freqs)
-        half_emb_h = torch.outer(seq_h, h_spatial_freqs)
-        half_emb_w = torch.outer(seq_w, w_spatial_freqs)
+        # Apply FPS scaling if provided (for temporal dimension)
+        if fps is not None and T_p > 1:
+            base_fps = 24.0  # Assuming base FPS is 24
+            seq_t = seq_t / fps[:1] * base_fps
         
-        # CRITICAL: Concatenate in [t, h, w] pattern, then repeat ENTIRE pattern
+        # Compute raw frequencies (angles) - NOT sin/cos yet!
+        # This matches what transformer_engine expects
+        half_emb_t = torch.outer(seq_t, temporal_freqs)  # (T, dim_t/2)
+        half_emb_h = torch.outer(seq_h, h_spatial_freqs)  # (H, dim_h/2)
+        half_emb_w = torch.outer(seq_w, w_spatial_freqs)  # (W, dim_w/2)
+        
+        # CRITICAL: Concatenate in the pattern expected by transformer_engine
+        # The pattern is [t, h, w] repeated TWICE to fill the full dimension
         em_T_H_W_D = torch.cat(
             [
                 repeat(half_emb_t, "t d -> t h w d", h=H_p, w=W_p),
                 repeat(half_emb_h, "h d -> t h w d", t=T_p, w=W_p),
                 repeat(half_emb_w, "w d -> t h w d", t=T_p, h=H_p),
-            ] * 2,  # Repeat the ENTIRE concatenated list
+            ] * 2,  # Repeat the entire pattern twice
             dim=-1,
         )
         
-        # Reshape to expected format
-        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").to(dtype)
+        # Reshape to format expected by apply_rotary_pos_emb
+        rope_emb = rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d")
+        
+        return rope_emb.to(dtype)
 
 # ===================== ATTENTION IMPLEMENTATION =====================
 class Attention(nn.Module):
@@ -857,9 +891,12 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         self._patch_embed_bias = False
         kwargs['use_adaln_lora'] = True
         kwargs['adaln_lora_dim'] = 256
+        kwargs['additional_concat_ch'] = additional_concat_ch
         super().__init__(additional_concat_ch=additional_concat_ch, **kwargs)
         if self.use_context_embedding:
-            self.context_embedding = nn.Embedding(num_embeddings=16, embedding_dim=kwargs["crossattn_emb_channels"])
+        # Make sure embedding dim matches crossattn_emb_channels from config!
+            crossattn_dim = kwargs.get("crossattn_emb_channels", 1024)
+            self.context_embedding = nn.Embedding(num_embeddings=16, embedding_dim=crossattn_dim)
             # Initialize with fixed seed like official implementation
             rng_state = torch.get_rng_state()
             torch.manual_seed(42)

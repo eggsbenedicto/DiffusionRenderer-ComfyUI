@@ -135,25 +135,18 @@ class CleanDiffusionRendererModel(nn.Module):
         except StopIteration:
             return {"device": torch.device("cuda"), "dtype": torch.bfloat16}
     
+    # Check VAE scaling in model_diffusion_renderer.py:
     def encode(self, x: Tensor) -> Tensor:
-        """
-        VAE encode pass-through, now with correct EDM scaling.
-        """
-        if self.vae is None: raise RuntimeError("VAE not initialized in model.")
-        if x.ndim != 5: raise ValueError(f"Model encode expects a 5D tensor (B,C,T,H,W), but got {x.ndim}D.")
-        
-        # Encode and then scale by sigma_data, as done in the official implementation.
-        return self.vae.encode(x) * self.scheduler.sigma_data
-        
+        encoded = self.vae.encode(x)
+        scaled = encoded * self.scheduler.sigma_data
+        print(f"[VAE] Encode: input range=[{x.min():.2f}, {x.max():.2f}], output range=[{scaled.min():.2f}, {scaled.max():.2f}]")
+        return scaled
+
     def decode(self, x: Tensor) -> Tensor:
-        """
-        VAE decode pass-through, now with correct EDM scaling.
-        """
-        if self.vae is None: raise RuntimeError("VAE not initialized in model.")
-        if x.ndim != 5: raise ValueError(f"Model decode expects a 5D latent (B,C,T,H,W), but got {x.ndim}D.")
-        
-        # Scale by 1/sigma_data before decoding, as done in the official implementation.
-        return self.vae.decode(x / self.scheduler.sigma_data)
+        scaled = x / self.scheduler.sigma_data  
+        decoded = self.vae.decode(scaled)
+        print(f"[VAE] Decode: input range=[{x.min():.2f}, {x.max():.2f}], output range=[{decoded.min():.2f}, {decoded.max():.2f}]")
+        return decoded
         
     def prepare_diffusion_renderer_latent_conditions(
         self, data_batch: Dict[str, Tensor], condition_keys: list = None, **kwargs
