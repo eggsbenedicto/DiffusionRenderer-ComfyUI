@@ -108,6 +108,52 @@ class LoadDiffusionRendererModel:
         model_instance.to_empty(device=device)
         model_instance.to(dtype=dtype)
         model_instance.load_state_dict(state_dict, strict=True)
+
+        print("\n🔍 Checkpoint key analysis:")
+        sample_keys = list(state_dict.keys())[:20]
+        for key in sample_keys:
+            print(f"  {key}: shape={state_dict[key].shape}")
+
+        # Check for net. prefix
+        has_net_prefix = any(k.startswith('net.') for k in state_dict.keys())
+        print(f"\nCheckpoint has 'net.' prefix: {has_net_prefix}")
+
+        # If checkpoint has 'net.' prefix, remove it
+        if has_net_prefix:
+            new_state_dict = {}
+            for key, value in state_dict.items():
+                new_key = key.replace('net.', '', 1) if key.startswith('net.') else key
+                new_state_dict[new_key] = value
+            state_dict = new_state_dict
+            print("✅ Removed 'net.' prefix from checkpoint keys")
+
+        def check_if_weights_loaded(model):
+            """Check if model has non-zero weights (not just initialized)"""
+            total_params = 0
+            zero_params = 0
+    
+            for name, param in model.named_parameters():
+                total_params += param.numel()
+                if torch.allclose(param, torch.zeros_like(param), atol=1e-8):
+                    zero_params += param.numel()
+    
+            zero_percent = (zero_params / total_params) * 100
+            print(f"\n📊 Weight Analysis:")
+            print(f"  Total parameters: {total_params:,}")
+            print(f"  Zero parameters: {zero_params:,} ({zero_percent:.2f}%)")
+    
+            if zero_percent > 50:
+                print("  ❌ WARNING: Most weights are zero! Checkpoint may not be loaded properly!")
+            else:
+                print("  ✅ Weights appear to be loaded")
+    
+            # Check specific critical weights
+            if hasattr(model, 'net'):
+                if hasattr(model.net, 'context_embedding'):
+                    ctx_emb = model.net.context_embedding.weight
+                    print(f"  Context embedding: mean={ctx_emb.mean():.6f}, std={ctx_emb.std():.6f}")
+
+        check_if_weights_loaded(model_instance)
         
         del state_dict
         mm.soft_empty_cache()
@@ -123,6 +169,7 @@ class LoadDiffusionRendererModel:
             guidance=0.0,
             num_steps=15,
             seed=42,
+            dtype=dtype,
         )
         return (pipeline,)
 

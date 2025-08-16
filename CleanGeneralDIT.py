@@ -1,14 +1,20 @@
 import math
+import numpy as np
 import torch
 from torch import nn
 from typing import Dict, Tuple, Optional, Union
 from einops import rearrange, repeat
 
 def modulate(x, shift, scale):
-    # x shape: (S, B, D) where S is sequence length
+    # For THWBD format: x shape is (T, H, W, B, D)
     # shift, scale shape: (B, D)
-    # We need to reshape shift/scale to (1, B, D) to broadcast over the sequence dim
-    return x * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
+    # We need to reshape shift/scale to (1, 1, 1, B, D) to broadcast
+    if x.ndim == 5:  # THWBD format
+        return x * (1 + scale.unsqueeze(0).unsqueeze(0).unsqueeze(0)) + shift.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    elif x.ndim == 3:  # Standard (S, B, D) format
+        return x * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
+    else:
+        raise ValueError(f"Unexpected tensor dimensions: {x.ndim}")
 
 # ===================== RMS NORMALIZATION =====================
 class RMSNorm(nn.Module):
@@ -41,167 +47,220 @@ def get_normalization_pure_torch(name: str, channels: int):
     else:
         raise ValueError(f"Normalization {name} not found")
 
-# ===================== ROPE IMPLEMENTATION =====================
-def apply_rotary_pos_emb_pure_torch(x: torch.Tensor, rope_emb: torch.Tensor, tensor_format: str = "sbhd", fused: bool = True) -> torch.Tensor:
+# ===================== SINCOS POS EMB (for extra_per_block_abs_pos_emb) =====================
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
-    Pure PyTorch implementation matching transformer_engine's apply_rotary_pos_emb behavior
+    EXACTLY matching official implementation
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / 10000**omega
+
+    pos = pos.reshape(-1)
+    out = np.einsum("m,d->md", pos, omega)
+
+    emb_sin = np.sin(out)
+    emb_cos = np.cos(out)
+
+    # CRITICAL: Order is [sin, cos] not [cos, sin]!
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)
+    return emb
+
+def normalize(x: torch.Tensor, dim: Optional[list] = None, eps: float = 0) -> torch.Tensor:
+    """
+    EXACTLY matching official normalize function
+    """
+    if dim is None:
+        dim = list(range(1, x.ndim))
+    norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
+    # CRITICAL: This specific formula for adding epsilon
+    norm = torch.add(eps, norm, alpha=np.sqrt(norm.numel() / x.numel()))
+    return x / norm.to(x.dtype)
+
+class SinCosPosEmbAxis(nn.Module):
+    """
+    Fixed implementation matching official for extra_per_block_abs_pos_emb
+    """
+    def __init__(
+        self,
+        model_channels: int,
+        len_h: int,
+        len_w: int,
+        len_t: int,
+        h_extrapolation_ratio: float = 1.0,
+        w_extrapolation_ratio: float = 1.0,
+        t_extrapolation_ratio: float = 1.0,
+        **kwargs
+    ):
+        super().__init__()
+        dim = model_channels
+        dim_h = dim // 6 * 2
+        dim_w = dim_h
+        dim_t = dim - 2 * dim_h
+        assert dim == dim_h + dim_w + dim_t
+
+        # Generate embeddings with extrapolation
+        emb_h = get_1d_sincos_pos_embed_from_grid(dim_h, np.arange(len_h) * 1.0 / h_extrapolation_ratio)
+        emb_w = get_1d_sincos_pos_embed_from_grid(dim_w, np.arange(len_w) * 1.0 / w_extrapolation_ratio)
+        emb_t = get_1d_sincos_pos_embed_from_grid(dim_t, np.arange(len_t) * 1.0 / t_extrapolation_ratio)
+
+        self.register_buffer("pos_emb_h", torch.from_numpy(emb_h).float(), persistent=False)
+        self.register_buffer("pos_emb_w", torch.from_numpy(emb_w).float(), persistent=False)
+        self.register_buffer("pos_emb_t", torch.from_numpy(emb_t).float(), persistent=False)
+
+    def forward(self, x_patches: torch.Tensor, fps=None) -> torch.Tensor:
+        B, T, H, W, C = x_patches.shape
+        device = x_patches.device
+        dtype = x_patches.dtype
+        
+        # Move buffers to correct device if needed
+        if self.pos_emb_h.device != device:
+            self.pos_emb_h = self.pos_emb_h.to(device)
+            self.pos_emb_w = self.pos_emb_w.to(device)
+            self.pos_emb_t = self.pos_emb_t.to(device)
+        
+        emb_h_H = self.pos_emb_h[:H]
+        emb_w_W = self.pos_emb_w[:W]
+        emb_t_T = self.pos_emb_t[:T]
+        
+        # Concatenate in the EXACT order as official
+        emb = torch.cat(
+            [
+                repeat(emb_t_T, "t d-> b t h w d", b=B, h=H, w=W),
+                repeat(emb_h_H, "h d-> b t h w d", b=B, t=T, w=W),
+                repeat(emb_w_W, "w d-> b t h w d", b=B, t=T, h=H),
+            ],
+            dim=-1
+        ).to(dtype)
+        
+        # CRITICAL: Apply normalization exactly as official
+        return normalize(emb, dim=-1, eps=1e-6)
+
+# ===================== ROPE IMPLEMENTATION =====================
+def apply_rotary_pos_emb_pure_torch(x: torch.Tensor, freqs: torch.Tensor, tensor_format: str = "sbhd", fused: bool = True):
+    """
+    Apply rotary position embeddings to input tensor.
+    
+    CRITICAL: The official transformer_engine version expects raw frequencies,
+    not pre-computed sin/cos values. This is a key difference!
     
     Args:
-        x: Input tensor
-        rope_emb: RoPE embedding frequencies (raw frequencies, not sin/cos) 
-        tensor_format: Format of input tensor ("sbhd" = seq, batch, heads, dim)
-        fused: Whether to use fused implementation (always True for our case)
+        x: Input tensor in format specified by tensor_format
+        freqs: Raw frequency values (not sin/cos), shape should broadcast with x
+        tensor_format: Format string for input tensor
+        fused: Whether to use fused implementation
     """
+    # Ensure freqs are on the same device and dtype as x
+    device = x.device
+    dtype = x.dtype
+    
     if tensor_format == "sbhd":
         # x shape: (S, B, H, D)
-        # rope_emb shape: (S, 1, 1, D)
+        # freqs shape: (S, 1, 1, D) 
         seq_len, batch, heads, dim = x.shape
         
-        # Remove singleton dimensions from rope_emb
-        freqs = rope_emb.squeeze(1).squeeze(1)  # (S, D)
+        # freqs contains raw frequencies, need to compute sin/cos
+        freqs = freqs.squeeze(1).squeeze(1)  # (S, D)
         
-        # From transformer_engine issue #552, the core rotation formula is:
-        # t = (t * freqs.cos().to(t.dtype)) + (_rotate_half(t) * freqs.sin().to(t.dtype))
-        # This matches the optimization mentioned in the issue
+        # Expand frequencies to match x dimensions
+        freqs = freqs.unsqueeze(1).unsqueeze(1).expand(seq_len, batch, heads, dim)
         
-        def rotate_half(x):
-            """Rotates half the hidden dims of the input."""
-            x1, x2 = x.chunk(2, dim=-1)
-            return torch.cat((-x2, x1), dim=-1)
+        # Split x into two halves for rotation
+        x_r, x_i = x.chunk(2, dim=-1)
         
-        # Expand freqs to match x dimensions: (S, 1, 1, D) -> (S, B, H, D)
-        freqs_expanded = freqs.unsqueeze(1).unsqueeze(1).expand_as(x)
+        # Apply rotation using angle (frequency * position is already in freqs)
+        cos_freqs = freqs[..., :dim//2].cos().to(dtype)
+        sin_freqs = freqs[..., :dim//2].sin().to(dtype)
         
-        # Apply the rotation formula from transformer_engine
-        # This is the exact formula mentioned in transformer_engine issue #552
-        cos_freqs = freqs_expanded.cos().to(x.dtype)
-        sin_freqs = freqs_expanded.sin().to(x.dtype)
+        # Apply rotation formula: (x_r + i*x_i) * (cos + i*sin)
+        out_r = x_r * cos_freqs - x_i * sin_freqs
+        out_i = x_r * sin_freqs + x_i * cos_freqs
         
-        rotated = (x * cos_freqs) + (rotate_half(x) * sin_freqs)
-        
-        return rotated
+        # Concatenate back
+        return torch.cat([out_r, out_i], dim=-1)
     else:
         raise NotImplementedError(f"Tensor format {tensor_format} not implemented")
 
 class CleanRoPE3D(nn.Module):
-    def __init__(self, head_dim: int, **kwargs):
+    def __init__(self, head_dim: int, 
+                 h_extrapolation_ratio: float = 1.0,
+                 w_extrapolation_ratio: float = 1.0,
+                 t_extrapolation_ratio: float = 1.0,
+                 **kwargs):
         super().__init__()
         self.head_dim = head_dim
-        # Use a longer sequence buffer to match official implementation
-        self.register_buffer("seq", torch.arange(max(512, head_dim), dtype=torch.float))
+        # Keep buffer for checkpoint compatibility
+        self.register_buffer("seq", torch.arange(128, dtype=torch.float))
         
-        # Split dimensions EXACTLY like official VideoRopePosition3DEmb
+        # Split dimensions EXACTLY like official
         dim = head_dim
         dim_h = dim // 6 * 2
         dim_w = dim_h  
         dim_t = dim - 2 * dim_h
-        assert dim == dim_h + dim_w + dim_t, f"RoPE head_dim setup failed: {dim} != {dim_h} + {dim_w} + {dim_t}"
-
-        # Store dimension info
+        assert dim == dim_h + dim_w + dim_t
+        
         self.dim_h = dim_h
         self.dim_w = dim_w
         self.dim_t = dim_t
         
-        # Pre-compute frequency ranges EXACTLY like official implementation
-        self.register_buffer("dim_spatial_range", 
-                           torch.arange(0, dim_h, 2)[:dim_h//2].float() / dim_h,
-                           persistent=False)
-        self.register_buffer("dim_temporal_range",
-                           torch.arange(0, dim_t, 2)[:dim_t//2].float() / dim_t,
-                           persistent=False)
+        # CRITICAL: Create frequency ranges - no cuda() here, will move to device later
+        dim_spatial_range = torch.arange(0, dim_h, 2)[:dim_h//2].float() / dim_h
+        dim_temporal_range = torch.arange(0, dim_t, 2)[:dim_t//2].float() / dim_t
         
-        # Default extrapolation factors - EXACTLY matching official VideoRopePosition3DEmb
-        self.h_ntk_factor = 1.0  
-        self.w_ntk_factor = 1.0
-        self.t_ntk_factor = 2.0  # Official uses 2.0 for temporal
+        self.register_buffer("dim_spatial_range", dim_spatial_range, persistent=False)
+        self.register_buffer("dim_temporal_range", dim_temporal_range, persistent=False)
+        
+        # Calculate NTK factors EXACTLY like official
+        self.h_ntk_factor = h_extrapolation_ratio ** (dim_h / (dim_h - 2)) if dim_h > 2 else h_extrapolation_ratio
+        self.w_ntk_factor = w_extrapolation_ratio ** (dim_w / (dim_w - 2)) if dim_w > 2 else w_extrapolation_ratio
+        self.t_ntk_factor = t_extrapolation_ratio ** (dim_t / (dim_t - 2)) if dim_t > 2 else t_extrapolation_ratio
 
-    def forward(self, x_patches: torch.Tensor):
-        """
-        Generate RoPE embeddings EXACTLY matching official VideoRopePosition3DEmb.generate_embeddings
-        """
+    def forward(self, x_patches: torch.Tensor, fps=None):
         B, T_p, H_p, W_p, D_model = x_patches.shape
         device = x_patches.device
+        dtype = x_patches.dtype
         
-        # Compute theta values with NTK scaling - EXACTLY like official
+        # Move buffers to correct device if needed
+        if self.dim_spatial_range.device != device:
+            self.dim_spatial_range = self.dim_spatial_range.to(device)
+            self.dim_temporal_range = self.dim_temporal_range.to(device)
+            self.seq = self.seq.to(device)
+        
+        # Compute theta values with NTK scaling
         h_theta = 10000.0 * self.h_ntk_factor
         w_theta = 10000.0 * self.w_ntk_factor  
         t_theta = 10000.0 * self.t_ntk_factor
         
-        # Compute frequencies - EXACTLY like official
-        h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range.to(device))
-        w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range.to(device))
-        temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range.to(device))
+        # Compute frequencies
+        h_spatial_freqs = 1.0 / (h_theta ** self.dim_spatial_range)
+        w_spatial_freqs = 1.0 / (w_theta ** self.dim_spatial_range)
+        temporal_freqs = 1.0 / (t_theta ** self.dim_temporal_range)
         
-        # Create position sequences - EXACTLY like official
-        seq_t = self.seq[:T_p].to(device)
-        seq_h = self.seq[:H_p].to(device) 
-        seq_w = self.seq[:W_p].to(device)
+        # Create position sequences
+        seq_t = self.seq[:T_p] if T_p <= len(self.seq) else torch.arange(T_p, device=device, dtype=torch.float)
+        seq_h = self.seq[:H_p] if H_p <= len(self.seq) else torch.arange(H_p, device=device, dtype=torch.float)
+        seq_w = self.seq[:W_p] if W_p <= len(self.seq) else torch.arange(W_p, device=device, dtype=torch.float)
         
-        # Compute outer products - EXACTLY like official
+        # Compute outer products for half embeddings (frequencies only, not sin/cos yet)
         half_emb_t = torch.outer(seq_t, temporal_freqs)
         half_emb_h = torch.outer(seq_h, h_spatial_freqs)
         half_emb_w = torch.outer(seq_w, w_spatial_freqs)
         
-        # THIS IS THE CRITICAL PART: concatenate in [t, h, w] * 2 pattern
-        # EXACTLY matching official VideoRopePosition3DEmb.generate_embeddings
+        # CRITICAL: Concatenate in [t, h, w] pattern, then repeat ENTIRE pattern
         em_T_H_W_D = torch.cat(
             [
                 repeat(half_emb_t, "t d -> t h w d", h=H_p, w=W_p),
-                repeat(half_emb_h, "h d -> t h w d", t=T_p, w=W_p),  
+                repeat(half_emb_h, "h d -> t h w d", t=T_p, w=W_p),
                 repeat(half_emb_w, "w d -> t h w d", t=T_p, h=H_p),
-            ] * 2,  # Repeat the entire pattern twice - this is the key difference!
+            ] * 2,  # Repeat the ENTIRE concatenated list
             dim=-1,
         )
         
-        # Reshape to expected format - EXACTLY like official
-        final_rope_emb = rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d")
-        
-        return final_rope_emb.to(x_patches.dtype)
+        # Reshape to expected format
+        return rearrange(em_T_H_W_D, "t h w d -> (t h w) 1 1 d").to(dtype)
 
 # ===================== ATTENTION IMPLEMENTATION =====================
-class PytorchDotProductAttention(nn.Module):
-    """
-    Pure PyTorch implementation to replace transformer_engine's DotProductAttention
-    """
-    def __init__(self, heads, dim_head, num_gqa_groups=None, attention_dropout=0.0, 
-                 qkv_format="sbhd", attn_mask_type="no_mask", **kwargs):
-        super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head
-        self.num_gqa_groups = num_gqa_groups or heads
-        self.attention_dropout = attention_dropout
-        self.qkv_format = qkv_format
-        self.attn_mask_type = attn_mask_type
-        
-        if attention_dropout > 0:
-            self.dropout = nn.Dropout(attention_dropout)
-        else:
-            self.dropout = None
-    
-    def forward(self, q, k, v, core_attention_bias_type=None, core_attention_bias=None):
-        """
-        Forward pass matching transformer_engine's DotProductAttention interface
-        """
-        if self.qkv_format == "sbhd":
-            # Convert from (seq, batch, heads, dim) to (batch, heads, seq, dim)
-            q = q.permute(1, 2, 0, 3)  # (B, H, S, D)
-            k = k.permute(1, 2, 0, 3)  # (B, H, S, D)
-            v = v.permute(1, 2, 0, 3)  # (B, H, S, D)
-        
-        # Apply scaled dot-product attention
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=None, 
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=False
-        )
-        
-        if self.qkv_format == "sbhd":
-            # Convert back to (seq, batch, heads, dim)
-            out = out.permute(2, 0, 1, 3)
-        
-        return out
-
 class Attention(nn.Module):
     """
     Pure PyTorch implementation matching the official transformer_engine-based Attention
@@ -215,9 +274,9 @@ class Attention(nn.Module):
         dropout=0.0,
         qkv_bias: bool = False,
         out_bias: bool = False,
-        qkv_norm: str = "RRI",  # R=RMSNorm for q,k; I=Identity for v (matches official)
+        qkv_norm: str = "RRI",  # R=RMSNorm for q,k; I=Identity for v
         qkv_norm_mode: str = "per_head",
-        backend: str = "torch",  # We're always using torch
+        backend: str = "torch",
         qkv_format: str = "sbhd",
     ) -> None:
         super().__init__()
@@ -235,9 +294,9 @@ class Attention(nn.Module):
         if self.qkv_norm_mode == "per_head":
             norm_dim = dim_head
         else:
-            raise ValueError(f"Normalization mode {self.qkv_norm_mode} not found, only support 'per_head'")
+            raise ValueError(f"Normalization mode {self.qkv_norm_mode} not found")
 
-        # Create Q, K, V projections with normalization (matching official pattern)
+        # Create Q, K, V projections with normalization
         self.to_q = nn.Sequential(
             nn.Linear(query_dim, inner_dim, bias=qkv_bias),
             get_normalization_pure_torch(qkv_norm[0], norm_dim),
@@ -256,40 +315,33 @@ class Attention(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Use our pure PyTorch attention implementation
-        self.attn_op = PytorchDotProductAttention(
-            heads=heads,
-            dim_head=dim_head,
-            num_gqa_groups=heads,
-            attention_dropout=0.0,
-            qkv_format=qkv_format,
-        )
-
     def cal_qkv(self, x, context=None, mask=None, rope_emb=None, **kwargs):
         """
-        Calculate Q, K, V with per-head normalization - EXACTLY matching official Attention.cal_qkv
+        Calculate Q, K, V with per-head normalization
+        Now expects 3D tensors only - 5D handling is done in VideoAttn
         """
-        if self.qkv_norm_mode == "per_head":
-            q = self.to_q[0](x)
-            context = x if context is None else context
-            k = self.to_k[0](context)
-            v = self.to_v[0](context)
+        # Apply linear projections
+        q = self.to_q[0](x)
+        
+        # Handle context for cross-attention
+        if context is None:
+            context = x
             
-            # Reshape for per-head normalization - CRITICAL STEP from official implementation
-            # This matches: "map(lambda t: rearrange(t, "b ... (n c) -> b ... n c", n=self.heads, c=self.dim_head)"
-            q, k, v = map(
-                lambda t: rearrange(t, "s b (n c) -> s b n c", n=self.heads, c=self.dim_head),
-                (q, k, v),
-            )
-        else:
-            raise ValueError(f"Normalization mode {self.qkv_norm_mode} not found")
-
-        # Apply per-head normalization - EXACTLY like official
+        k = self.to_k[0](context)
+        v = self.to_v[0](context)
+        
+        # Reshape for per-head normalization
+        q, k, v = map(
+            lambda t: rearrange(t, "s b (n c) -> s b n c", n=self.heads, c=self.dim_head),
+            (q, k, v),
+        )
+        
+        # Apply per-head normalization
         q = self.to_q[1](q)
         k = self.to_k[1](k)
         v = self.to_v[1](v)
         
-        # Apply RoPE only for self-attention - EXACTLY like official
+        # Apply RoPE only for self-attention
         if self.is_selfattn and rope_emb is not None:
             q = apply_rotary_pos_emb_pure_torch(q, rope_emb, tensor_format=self.qkv_format, fused=True)
             k = apply_rotary_pos_emb_pure_torch(k, rope_emb, tensor_format=self.qkv_format, fused=True)
@@ -297,20 +349,111 @@ class Attention(nn.Module):
         return q, k, v
 
     def cal_attn(self, q, k, v, mask=None):
-        """Calculate attention using pure PyTorch - matching transformer_engine interface"""
-        if self.backend == "torch":
-            # Use our PyTorch attention implementation that mimics transformer_engine behavior
-            out = self.attn_op(q, k, v)
-            return self.to_out(out)
-        else:
-            raise ValueError(f"Backend {self.backend} not found")
+        """Calculate attention - handles both THWBD and standard formats"""
+        # q, k, v are (S, B, H, D) where S could be T*H*W or M
+        S_q, B, H, D = q.shape
+        S_kv = k.shape[0]
+        
+        # Convert to (B, H, S, D) for PyTorch's scaled_dot_product_attention
+        q = q.permute(1, 2, 0, 3)  # (B, H, S_q, D)
+        k = k.permute(1, 2, 0, 3)  # (B, H, S_kv, D)
+        v = v.permute(1, 2, 0, 3)  # (B, H, S_kv, D)
+        
+        # Apply scaled dot-product attention
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=0.0,
+            is_causal=False
+        )
+        
+        # Convert back to (S, B, H, D)
+        out = out.permute(2, 0, 1, 3)  # (S_q, B, H, D)
+        
+        # Flatten heads and apply output projection
+        out = rearrange(out, "s b h d -> s b (h d)")
+        return self.to_out(out)
 
     def forward(self, x, context=None, mask=None, rope_emb=None, **kwargs):
         """
-        Forward pass matching the official Attention interface exactly
+        Forward pass matching the official Attention interface
         """
         q, k, v = self.cal_qkv(x, context, mask, rope_emb=rope_emb, **kwargs)
         return self.cal_attn(q, k, v, mask)
+
+# ===================== VIDEO ATTENTION WRAPPER =====================
+class VideoAttn(nn.Module):
+    def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, 
+                 bias: bool = False, **kwargs):
+        super().__init__()
+        self.attn = Attention(
+            query_dim=x_dim, 
+            context_dim=context_dim, 
+            heads=num_heads,
+            dim_head=x_dim // num_heads, 
+            qkv_bias=bias, 
+            out_bias=bias,
+            qkv_norm="RRI",
+            qkv_norm_mode="per_head",
+            backend="torch",
+            qkv_format="sbhd"
+        )
+    
+    def forward(self, x, context=None, rope_emb_L_1_1_D=None, **kwargs):
+        # Store original shape if 5D
+        if x.ndim == 5:
+            T, H, W, B, D = x.shape
+            # Flatten spatial-temporal dimensions
+            x_flat = rearrange(x, "t h w b d -> (t h w) b d")
+            
+            # Flatten context if it's also 5D
+            if context is not None and context.ndim == 5:
+                context = rearrange(context, "t h w b d -> (t h w) b d")
+            elif context is not None and context.ndim == 3:
+                # Context is already in (M, B, D) format for cross-attention
+                pass
+            
+            # Apply attention
+            out_flat = self.attn(x_flat, context=context, rope_emb=rope_emb_L_1_1_D, **kwargs)
+            
+            # Reshape back to 5D
+            out = rearrange(out_flat, "(t h w) b d -> t h w b d", t=T, h=H, w=W)
+            return out
+        else:
+            # Standard 3D processing
+            return self.attn(x, context=context, rope_emb=rope_emb_L_1_1_D, **kwargs)
+
+# ===================== FEEDFORWARD NETWORK =====================
+class OfficialGPT2FeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, bias: bool = False, **kwargs):
+        super().__init__()
+        self.layer1 = nn.Linear(dim, hidden_dim, bias=bias)
+        self.activation = nn.GELU()
+        self.layer2 = nn.Linear(hidden_dim, dim, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the GPT-2 style Feed Forward network.
+        Automatically handles both 3D and 5D tensors
+        """
+        # Store original shape if 5D
+        if x.ndim == 5:
+            T, H, W, B, D = x.shape
+            x = rearrange(x, "t h w b d -> (t h w) b d")
+            is_5d = True
+        else:
+            is_5d = False
+            
+        # Process through MLP
+        x = self.layer1(x)
+        x = self.activation(x)
+        x = self.layer2(x)
+        
+        # Reshape back if needed
+        if is_5d:
+            x = rearrange(x, "(t h w) b d -> t h w b d", t=T, h=H, w=W)
+            
+        return x
 
 # ===================== TIMESTEP EMBEDDING =====================
 class CleanTimesteps(nn.Module):
@@ -335,37 +478,25 @@ class CleanTimesteps(nn.Module):
         return emb.to(in_dtype)
 
 class CleanTimestepEmbedding(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, use_adaln_lora: bool, adaln_lora_dim: int):
+    def __init__(self, in_channels: int, out_channels: int, use_adaln_lora: bool, adaln_lora_dim: int = 256):
         super().__init__()
         self.use_adaln_lora = use_adaln_lora
         self.linear_1 = nn.Linear(in_channels, out_channels, bias=not use_adaln_lora)
         self.activation = nn.SiLU()
         if use_adaln_lora:
-            # The output here is split into chunks for each block later on.
             self.linear_2 = nn.Linear(out_channels, 3 * out_channels, bias=False)
         else:
             self.linear_2 = nn.Linear(out_channels, out_channels, bias=True)
 
     def forward(self, sample: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Processes the sinusoidal timestep embedding.
-        Args:
-            sample: The sinusoidal embedding from the CleanTimesteps module.
-        Returns:
-            A tuple of (emb_B_D, adaln_lora_B_3D).
-        """
-        # Pass through the linear layers
         processed_emb = self.linear_1(sample)
         processed_emb = self.activation(processed_emb)
         processed_emb = self.linear_2(processed_emb)
 
         if self.use_adaln_lora:
-            # The fully processed embedding is the LoRA component
             adaln_lora_emb = processed_emb
-            # The main embedding for AdaLN is the original sinusoidal input
             main_emb = sample
         else:
-            # If not using LoRA, the main embedding is the processed one
             main_emb = processed_emb
             adaln_lora_emb = None
 
@@ -380,32 +511,17 @@ class CleanPatchEmbed(nn.Module):
         
         patch_dim = in_channels * (spatial_patch_size ** 2) * temporal_patch_size
         
-        # Create an nn.ModuleDict to hold the linear layer under the key '1'.
-        # This will create the parameter name "proj.1.weight", exactly what the checkpoint has.
         self.proj = nn.ModuleDict({
             '1': nn.Linear(patch_dim, out_channels, bias=bias)
         })
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Takes a 5D video tensor and embeds it into a sequence of patch tokens.
-        Args:
-            x: Input tensor of shape (B, C, T, H, W).
-        Returns:
-            A tensor of shape (B, T_p, H_p, W_p, D_model) where D_model is out_channels.
-        """
-        # B: Batch size, C: Channels, T: Time, H: Height, W: Width
         B, C, T, H, W = x.shape
         
-        # Assert that dimensions are divisible by patch sizes, as in the original code.
-        # This is a good sanity check.
-        assert H % self.spatial_patch_size == 0, f"Input height {H} is not divisible by patch size {self.spatial_patch_size}"
-        assert W % self.spatial_patch_size == 0, f"Input width {W} is not divisible by patch size {self.spatial_patch_size}"
-        assert T % self.temporal_patch_size == 0, f"Input temporal dim {T} is not divisible by patch size {self.temporal_patch_size}"
+        assert H % self.spatial_patch_size == 0
+        assert W % self.spatial_patch_size == 0
+        assert T % self.temporal_patch_size == 0
 
-        # Use einops.rearrange to slice the input into patches and flatten each patch.
-        # 'm' and 'n' are spatial_patch_size, 'r' is temporal_patch_size.
-        # The output of rearrange is (B, T_patches, H_patches, W_patches, C*r*m*n)
         patches = rearrange(
             x, 'b c (t r) (h m) (w n) -> b t h w (c r m n)', 
             r=self.temporal_patch_size, 
@@ -413,57 +529,13 @@ class CleanPatchEmbed(nn.Module):
             n=self.spatial_patch_size
         )
         
-        # Apply the linear projection to the last dimension (the flattened patch).
         embedded_patches = self.proj['1'](patches)
         
         return embedded_patches
 
-# ===================== VIDEO ATTENTION WRAPPER =====================
-class VideoAttn(nn.Module):
-    def __init__(self, x_dim: int, context_dim: Optional[int], num_heads: int, bias: bool = False, **kwargs):
-        super().__init__()
-        self.attn = Attention(
-            query_dim=x_dim, 
-            context_dim=context_dim, 
-            heads=num_heads,
-            dim_head=x_dim // num_heads, 
-            qkv_bias=bias, 
-            out_bias=bias,
-            qkv_norm="RRI",  # R=RMSNorm for q,k; I=Identity for v
-            qkv_norm_mode="per_head",
-            backend="torch",
-            qkv_format="sbhd"
-        )
-    
-    def forward(self, x, context=None, rope_emb_L_1_1_D=None, **kwargs):
-        return self.attn(x, context=context, rope_emb=rope_emb_L_1_1_D, **kwargs)
-
-# ===================== FEEDFORWARD NETWORK =====================
-class OfficialGPT2FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, bias: bool = False, **kwargs):
-        super().__init__()
-        self.layer1 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.activation = nn.GELU()
-        self.layer2 = nn.Linear(hidden_dim, dim, bias=bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the GPT-2 style Feed Forward network.
-        """
-        # Pass through the first linear layer
-        x = self.layer1(x)
-        
-        # Apply the GELU activation function
-        x = self.activation(x)
-        
-        # Pass through the second linear layer
-        x = self.layer2(x)
-        
-        return x
-
 # ===================== DIT BUILDING BLOCKS =====================
 class OfficialDITBuildingBlock(nn.Module):
-    def __init__( self, block_type: str, x_dim: int, context_dim: Optional[int], num_heads: int,
+    def __init__(self, block_type: str, x_dim: int, context_dim: Optional[int], num_heads: int,
                   mlp_ratio: float = 4.0, bias: bool = False, **kwargs):
         super().__init__()
         block_type = block_type.lower()
@@ -495,7 +567,9 @@ class OfficialDITBuildingBlock(nn.Module):
         emb_B_D: torch.Tensor,
         crossattn_emb: torch.Tensor,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
-        rope_emb_L_1_1_D: Optional[torch.Tensor] = None
+        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        crossattn_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if self.use_adaln_lora and adaln_lora_B_3D is not None:
             modulation = self.adaLN_modulation(emb_B_D) + adaln_lora_B_3D
@@ -504,20 +578,25 @@ class OfficialDITBuildingBlock(nn.Module):
         
         shift, scale, gate = modulation.chunk(self.n_adaln_chunks, dim=1)
         x_modulated = modulate(self.norm_state(x), shift, scale)
+        
+        # Process through the block
+        if self.block_type in ["mlp", "ff"]:
+            block_output = self.block(x_modulated)
+        elif self.block_type in ["ca", "cross_attn"]:
+            block_output = self.block(x_modulated, context=crossattn_emb, rope_emb_L_1_1_D=None)
+        else:  # self-attention ("fa")
+            block_output = self.block(x_modulated, context=None, rope_emb_L_1_1_D=rope_emb_L_1_1_D)
 
-        # Use a float32 autocast context for the attention and MLP blocks
-        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-            if self.block_type in ["mlp", "ff"]:
-                block_output = self.block(x_modulated)
-            elif self.block_type in ["ca", "cross_attn"]:
-                block_output = self.block(x_modulated, context=crossattn_emb, rope_emb_L_1_1_D=rope_emb_L_1_1_D)
-            else: # self-attention ("fa")
-                block_output = self.block(x_modulated, context=None, rope_emb_L_1_1_D=rope_emb_L_1_1_D)
-
-        return x + gate.unsqueeze(0) * block_output
+        # Apply gate and residual
+        if x.ndim == 5:
+            # gate is (B, D), need to broadcast to (T, H, W, B, D)
+            gate_expanded = gate.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            return x + gate_expanded * block_output
+        else:
+            return x + gate.unsqueeze(0) * block_output
 
 class OfficialGeneralDITTransformerBlock(nn.Module):
-    def __init__( self, x_dim: int, context_dim: int, num_heads: int, block_config: str,
+    def __init__(self, x_dim: int, context_dim: int, num_heads: int, block_config: str,
                   mlp_ratio: float = 4.0, **kwargs):
         super().__init__()
         self.blocks = nn.ModuleList()
@@ -525,22 +604,30 @@ class OfficialGeneralDITTransformerBlock(nn.Module):
             self.blocks.append(OfficialDITBuildingBlock(
                 block_type.strip(), x_dim, context_dim, num_heads, mlp_ratio, **kwargs
             ))
+            
     def forward(
         self,
         x: torch.Tensor,
         emb_B_D: torch.Tensor,
         crossattn_emb: torch.Tensor,
+        crossattn_mask: Optional[torch.Tensor] = None,
         adaln_lora_B_3D: Optional[torch.Tensor] = None,
-        rope_emb_L_1_1_D: Optional[torch.Tensor] = None # EXPLICIT ARGUMENT
+        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
+        extra_per_block_pos_emb: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        # Pass the rope_emb explicitly to each building block
+        # Add extra positional embedding once at the beginning
+        if extra_per_block_pos_emb is not None:
+            x = x + extra_per_block_pos_emb
+            
         for block in self.blocks:
             x = block(
                 x,
                 emb_B_D,
                 crossattn_emb,
                 adaln_lora_B_3D=adaln_lora_B_3D,
-                rope_emb_L_1_1_D=rope_emb_L_1_1_D
+                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                extra_per_block_pos_emb=None,  # Don't pass it to individual blocks
+                crossattn_mask=crossattn_mask
             )
         return x
 
@@ -564,10 +651,11 @@ class OfficialFinalLayer(nn.Module):
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(), nn.Linear(hidden_size, n_adaln_chunks * hidden_size, bias=False)
             )
+            
     def forward(self, x_BT_HW_D, emb_B_D, adaln_lora_B_3D: Optional[torch.Tensor] = None):
-        # 1. Calculate modulation params
+        input_dtype = x_BT_HW_D.dtype
+        
         if self.use_adaln_lora:
-            # The original code takes a slice of the lora embedding
             adaln_lora_chunk = adaln_lora_B_3D[:, : 2 * self.hidden_size]
             modulation = self.adaLN_modulation(emb_B_D) + adaln_lora_chunk
         else:
@@ -575,19 +663,14 @@ class OfficialFinalLayer(nn.Module):
         
         shift, scale = modulation.chunk(2, dim=1)
 
-        # 2. Apply AdaLN
-        # x is (B*T, H*W, D). shift/scale are (B, D).
-        # We need to repeat shift/scale to match the batch+time dim.
         B = emb_B_D.shape[0]
         T = x_BT_HW_D.shape[0] // B
         shift_BT_D = repeat(shift, "b d -> (b t) d", t=T)
         scale_BT_D = repeat(scale, "b d -> (b t) d", t=T)
         
-        # modulate for this shape: x is (BT, S, D), shift/scale are (BT, D)
         x_modulated = self.norm_final(x_BT_HW_D) * (1 + scale_BT_D.unsqueeze(1)) + shift_BT_D.unsqueeze(1)
         
-        # 3. Final linear projection
-        return self.linear(x_modulated)
+        return self.linear(x_modulated.to(input_dtype))
 
 # ===================== MAIN MODEL =====================
 class CleanGeneralDIT(nn.Module):
@@ -605,10 +688,26 @@ class CleanGeneralDIT(nn.Module):
         self.additional_concat_ch = kwargs.get('additional_concat_ch', 0)
         self._patch_embed_bias = getattr(self, '_patch_embed_bias', True)
         self.concat_padding_mask = kwargs.get('concat_padding_mask', True)
-        self._patch_embed_bias = getattr(self, '_patch_embed_bias', True)
+        
+        # Extract extrapolation ratios
+        self.rope_h_extrapolation_ratio = kwargs.get('rope_h_extrapolation_ratio', 1.0)
+        self.rope_w_extrapolation_ratio = kwargs.get('rope_w_extrapolation_ratio', 1.0)
+        self.rope_t_extrapolation_ratio = kwargs.get('rope_t_extrapolation_ratio', 1.0)
+        
+        # Extra positional embedding settings
+        self.extra_per_block_abs_pos_emb = kwargs.get('extra_per_block_abs_pos_emb', False)
+        self.extra_per_block_abs_pos_emb_type = kwargs.get('extra_per_block_abs_pos_emb_type', 'sincos')
+        self.extra_h_extrapolation_ratio = kwargs.get('extra_h_extrapolation_ratio', 1.0)
+        self.extra_w_extrapolation_ratio = kwargs.get('extra_w_extrapolation_ratio', 1.0)
+        self.extra_t_extrapolation_ratio = kwargs.get('extra_t_extrapolation_ratio', 1.0)
 
         self.patch_spatial = kwargs['patch_spatial']
         self.patch_temporal = kwargs['patch_temporal']
+        
+        # Get max dimensions for positional embeddings
+        self.max_img_h = kwargs.get('max_img_h', 1024)
+        self.max_img_w = kwargs.get('max_img_w', 1024)
+        self.max_frames = kwargs.get('max_frames', 128)
         
         in_ch = in_channels + self.additional_concat_ch + (1 if kwargs.get('concat_padding_mask', True) else 0)
         self.x_embedder = CleanPatchEmbed(
@@ -617,9 +716,31 @@ class CleanGeneralDIT(nn.Module):
         
         self.t_embedder = nn.Sequential(
             CleanTimesteps(model_channels),
-            CleanTimestepEmbedding(model_channels, model_channels, use_adaln_lora=kwargs.get('use_adaln_lora', False), adaln_lora_dim=kwargs.get('adaln_lora_dim', 256))
+            CleanTimestepEmbedding(model_channels, model_channels, 
+                                  use_adaln_lora=kwargs.get('use_adaln_lora', False), 
+                                  adaln_lora_dim=kwargs.get('adaln_lora_dim', 256))
         )
-        self.pos_embedder = CleanRoPE3D(head_dim=model_channels // num_heads)
+        
+        # Initialize RoPE with extrapolation ratios
+        self.pos_embedder = CleanRoPE3D(
+            head_dim=model_channels // num_heads,
+            h_extrapolation_ratio=self.rope_h_extrapolation_ratio,
+            w_extrapolation_ratio=self.rope_w_extrapolation_ratio,
+            t_extrapolation_ratio=self.rope_t_extrapolation_ratio
+        )
+        
+        # Initialize extra positional embeddings if needed
+        if self.extra_per_block_abs_pos_emb:
+            if self.extra_per_block_abs_pos_emb_type.lower() == 'sincos':
+                self.extra_pos_embedder = SinCosPosEmbAxis(
+                    model_channels=model_channels,
+                    len_h=self.max_img_h // self.patch_spatial,
+                    len_w=self.max_img_w // self.patch_spatial,
+                    len_t=self.max_frames // self.patch_temporal,
+                    h_extrapolation_ratio=self.extra_h_extrapolation_ratio,
+                    w_extrapolation_ratio=self.extra_w_extrapolation_ratio,
+                    t_extrapolation_ratio=self.extra_t_extrapolation_ratio
+                )
         
         self.blocks = nn.ModuleDict()
         
@@ -647,7 +768,6 @@ class CleanGeneralDIT(nn.Module):
         )
 
         # Use our improved RMSNorm for affine embedding normalization
-        affline_emb_norm = kwargs.get('affline_emb_norm', True)
         if affline_emb_norm:
             self.affline_norm = RMSNorm(model_channels)
         else:
@@ -656,14 +776,16 @@ class CleanGeneralDIT(nn.Module):
     def forward(self, x, timesteps, crossattn_emb, latent_condition, **kwargs):
         """
         Base forward pass for the General DiT.
-        'x' is the noised latent.
-        'latent_condition' is the encoded condition map(s).
-        'crossattn_emb' is for text or other guidance (like context_index).
         """
         # 1. Prepare Timestep Embeddings
         timesteps = timesteps.to(x.dtype)
         t_emb, adaln_lora_emb = self.t_embedder(timesteps.flatten())
         affline_emb = self.affline_norm(t_emb)
+        
+        # Ensure embeddings maintain input dtype
+        affline_emb = affline_emb.to(x.dtype)
+        if adaln_lora_emb is not None:
+            adaln_lora_emb = adaln_lora_emb.to(x.dtype)
 
         # 2. Concatenate input `x` with the condition and padding mask if needed.
         tensors_to_cat = [x, latent_condition]
@@ -678,31 +800,42 @@ class CleanGeneralDIT(nn.Module):
         x_patches = self.x_embedder(x_conditioned)
         B, T_p, H_p, W_p, D = x_patches.shape
 
-        # 4. Positional Embeddings (RoPE) - now using improved implementation
+        # 4. Positional Embeddings (RoPE)
         rope_emb = self.pos_embedder(x_patches) 
         
-        # 5. Main Transformer Blocks
-        x_rearranged = rearrange(x_patches, "B T H W D -> (T H W) B D")
+        # 4b. Extra positional embeddings if enabled
+        extra_pos_emb = None
+        if self.extra_per_block_abs_pos_emb:
+            extra_pos_emb = self.extra_pos_embedder(x_patches)
+            # Convert to THWBD format
+            extra_pos_emb = rearrange(extra_pos_emb, "B T H W D -> T H W B D")
         
-        # Cross-attention context also needs rearranging if it's not already
-        if crossattn_emb.ndim == 3: # (B, M, D)
-             crossattn_emb_rearranged = rearrange(crossattn_emb, "B M D -> M B D")
-        else: # Already rearranged
-             crossattn_emb_rearranged = crossattn_emb
+        # 5. Main Transformer Blocks - use THWBD format!
+        x_rearranged = rearrange(x_patches, "B T H W D -> T H W B D")
+        
+        # Cross-attention context also needs rearranging
+        if crossattn_emb.ndim == 3:  # (B, M, D)
+            crossattn_emb_rearranged = rearrange(crossattn_emb, "B M D -> M B D")
+        else:
+            crossattn_emb_rearranged = crossattn_emb
 
         for i in range(len(self.blocks)):
-             block = self.blocks[f"block{i}"]
-             x_rearranged = block(
-                 x=x_rearranged,
-                 emb_B_D=affline_emb,
-                 crossattn_emb=crossattn_emb_rearranged,
-                 adaln_lora_B_3D=adaln_lora_emb,
-                 rope_emb_L_1_1_D=rope_emb
-             )
+            block = self.blocks[f"block{i}"]
+            x_rearranged = block(
+                x=x_rearranged,
+                emb_B_D=affline_emb,
+                crossattn_emb=crossattn_emb_rearranged,
+                adaln_lora_B_3D=adaln_lora_emb,
+                rope_emb_L_1_1_D=rope_emb,
+                extra_per_block_pos_emb=extra_pos_emb
+            )
         
-        # 6. Final Layer
-        x_final = rearrange(x_rearranged, "(T H W) B D -> B T H W D", T=T_p, H=H_p, W=W_p)
+        # 6. Final Layer - convert back from THWBD
+        x_final = rearrange(x_rearranged, "T H W B D -> B T H W D")
         x_final_rearranged = rearrange(x_final, "B T H W D -> (B T) (H W) D")
+        
+        # Ensure dtype consistency before final layer
+        x_final_rearranged = x_final_rearranged.to(x.dtype)
         output = self.final_layer(x_final_rearranged, affline_emb, adaln_lora_B_3D=adaln_lora_emb)
         
         # 7. Unpatchify
@@ -727,6 +860,11 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         super().__init__(additional_concat_ch=additional_concat_ch, **kwargs)
         if self.use_context_embedding:
             self.context_embedding = nn.Embedding(num_embeddings=16, embedding_dim=kwargs["crossattn_emb_channels"])
+            # Initialize with fixed seed like official implementation
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(42)
+            torch.nn.init.uniform_(self.context_embedding.weight, -0.3, 0.3)
+            torch.set_rng_state(rng_state)
     
     def forward(self, x, timesteps, latent_condition, context_index, **kwargs):
         
@@ -737,7 +875,7 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
                 crossattn_emb = crossattn_emb.unsqueeze(1)
         else:
             B = x.shape[0]
-            # Create a dummy tensor if not using context embedding (e.g., for forward renderer)
+            # Create a dummy tensor if not using context embedding
             crossattn_emb_channels = self.blocks['block0'].blocks[1].block.attn.to_k[0].in_features
             crossattn_emb = torch.zeros(B, 1, crossattn_emb_channels, device=x.device, dtype=x.dtype)
 
