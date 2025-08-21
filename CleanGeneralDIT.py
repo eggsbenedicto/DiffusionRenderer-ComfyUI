@@ -354,6 +354,8 @@ class Attention(nn.Module):
         Calculate Q, K, V with per-head normalization
         Now expects 3D tensors only - 5D handling is done in VideoAttn
         """
+        if not hasattr(self, '_debug_counter'):
+            self._debug_counter = 0
         # Apply linear projections
         q = self.to_q[0](x)
         
@@ -379,6 +381,17 @@ class Attention(nn.Module):
         if self.is_selfattn and rope_emb is not None:
             q = apply_rotary_pos_emb_pure_torch(q, rope_emb, tensor_format=self.qkv_format, fused=True)
             k = apply_rotary_pos_emb_pure_torch(k, rope_emb, tensor_format=self.qkv_format, fused=True)
+
+        if self._debug_counter < 3 and context is not None and self.is_selfattn == False:
+            print(f"[Debug CA Input] Context shape: {context.shape}, mean: {context.mean():.6f}, std: {context.std():.6f}")
+            print(f"[Debug CA Input] X shape: {x.shape}, mean: {x.mean():.6f}, std: {x.std():.6f}")
+        
+         # Check raw projections before normalization
+            k_raw = self.to_k[0](context)
+            v_raw = self.to_v[0](context)
+            print(f"[Debug CA Raw] K projection mean: {k_raw.mean():.6f}, std: {k_raw.std():.6f}")
+            print(f"[Debug CA Raw] V projection mean: {v_raw.mean():.6f}, std: {v_raw.std():.6f}")
+            self._debug_counter += 1
             
         return q, k, v
 
@@ -387,6 +400,15 @@ class Attention(nn.Module):
         # q, k, v are (S, B, H, D) where S could be T*H*W or M
         S_q, B, H, D = q.shape
         S_kv = k.shape[0]
+
+        self._attn_debug_counter = 0
+
+        if S_kv == 1 and S_q > 1 and self._attn_debug_counter < 2:  
+            # Cross-attention pattern
+            #print(f"[Debug CA] Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
+            #print(f"[Debug CA] K mean: {k.mean():.6f}, std: {k.std():.6f}")
+            #print(f"[Debug CA] V mean: {v.mean():.6f}, std: {v.std():.6f}")
+            self._attn_debug_counter += 1
         
         # Convert to (B, H, S, D) for PyTorch's scaled_dot_product_attention
         q = q.permute(1, 2, 0, 3)  # (B, H, S_q, D)
@@ -618,6 +640,12 @@ class OfficialDITBuildingBlock(nn.Module):
             block_output = self.block(x_modulated)
         elif self.block_type in ["ca", "cross_attn"]:
             block_output = self.block(x_modulated, context=crossattn_emb, rope_emb_L_1_1_D=None)
+            # Debug cross-attention
+            if x.ndim == 5:
+                gate_mean = gate.mean().item()
+            else:
+                gate_mean = gate.mean().item()
+                print(f"[Debug CA Block] Input norm: {x_modulated.norm():.4f}, Output norm: {block_output.norm():.4f}, Gate mean: {gate_mean:.4f}")
         else:  # self-attention ("fa")
             block_output = self.block(x_modulated, context=None, rope_emb_L_1_1_D=rope_emb_L_1_1_D)
 
@@ -721,7 +749,7 @@ class CleanGeneralDIT(nn.Module):
         affline_emb_norm = kwargs.get('affline_emb_norm', True)
         self.additional_concat_ch = kwargs.get('additional_concat_ch', 0)
         self._patch_embed_bias = getattr(self, '_patch_embed_bias', True)
-        self.concat_padding_mask = kwargs.get('concat_padding_mask', True)
+        self.concat_padding_mask = kwargs.get('concat_padding_mask')
         
         # Extract extrapolation ratios
         self.rope_h_extrapolation_ratio = kwargs.get('rope_h_extrapolation_ratio', 1.0)
@@ -887,40 +915,158 @@ class CleanGeneralDIT(nn.Module):
 # ===================== DIFFUSION RENDERER VARIANT =====================
 class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
     def __init__(self, additional_concat_ch: int = 16, use_context_embedding: bool = True, **kwargs):
+        """
+        Initialize the Diffusion Renderer variant of GeneralDIT.
+        
+        Args:
+            additional_concat_ch: Number of additional channels to concatenate (16 for inverse, 136 for forward)
+            use_context_embedding: Whether to use context embeddings for conditioning
+            **kwargs: Additional arguments passed to parent class
+        """
         self.use_context_embedding = use_context_embedding
         self._patch_embed_bias = False
+        
+        # Force AdaLN-LoRA settings as per official implementation
         kwargs['use_adaln_lora'] = True
         kwargs['adaln_lora_dim'] = 256
         kwargs['additional_concat_ch'] = additional_concat_ch
-        super().__init__(additional_concat_ch=additional_concat_ch, **kwargs)
-        if self.use_context_embedding:
-        # Make sure embedding dim matches crossattn_emb_channels from config!
-            crossattn_dim = kwargs.get("crossattn_emb_channels", 1024)
-            self.context_embedding = nn.Embedding(num_embeddings=16, embedding_dim=crossattn_dim)
-            # Initialize with fixed seed like official implementation
-            rng_state = torch.get_rng_state()
-            torch.manual_seed(42)
-            torch.nn.init.uniform_(self.context_embedding.weight, -0.3, 0.3)
-            torch.set_rng_state(rng_state)
-    
-    def forward(self, x, timesteps, latent_condition, context_index, **kwargs):
         
-        # 1. Prepare Cross-Attention Embeddings from context_index
+        # Initialize parent class
+        super().__init__(**kwargs)
+        
+        # Initialize context embedding if needed
         if self.use_context_embedding:
-            crossattn_emb = self.context_embedding(context_index.long())
-            if crossattn_emb.ndim == 2:
-                crossattn_emb = crossattn_emb.unsqueeze(1)
-        else:
-            B = x.shape[0]
-            # Create a dummy tensor if not using context embedding
-            crossattn_emb_channels = self.blocks['block0'].blocks[1].block.attn.to_k[0].in_features
-            crossattn_emb = torch.zeros(B, 1, crossattn_emb_channels, device=x.device, dtype=x.dtype)
+            # Make sure embedding dim matches crossattn_emb_channels from config!
+            crossattn_dim = kwargs.get("crossattn_emb_channels", 1024)
+            self.context_embedding = nn.Embedding(
+                num_embeddings=16,  # Supports up to 16 different context types
+                embedding_dim=crossattn_dim
+            )
+            # Note: Don't reinitialize weights here - let the checkpoint values load!
+            # The checkpoint loading will overwrite these with the trained values
+    
+    def forward(self, x, timesteps, crossattn_emb=None, crossattn_mask=None,
+                fps=None, image_size=None, padding_mask=None, scalar_feature=None,
+                data_type=None, latent_condition=None, latent_condition_sigma=None,
+                condition_video_augment_sigma=None, context_index=None, **kwargs):
+        """
+        Forward pass for Diffusion Renderer.
+        
+        This method handles the context_index to generate appropriate cross-attention embeddings,
+        then passes all arguments to the parent class's forward method.
+        
+        Args:
+            x: Input tensor [B, C, T, H, W]
+            timesteps: Timestep tensor [B]
+            crossattn_emb: Cross-attention embeddings [B, M, D] (will be overridden if context_index provided)
+            crossattn_mask: Optional cross-attention mask
+            fps: Frames per second tensor
+            image_size: Image size tensor
+            padding_mask: Padding mask tensor
+            scalar_feature: Scalar features
+            data_type: Type of data (video/image)
+            latent_condition: Latent condition tensor (encoded RGB + mask for inverse)
+            latent_condition_sigma: Sigma for latent condition
+            condition_video_augment_sigma: Sigma for video augmentation
+            context_index: Index for context embedding (0-4 for different G-buffers)
+            **kwargs: Additional keyword arguments
+        
+        Returns:
+            Output tensor from the diffusion model
+        """
 
-        # 2. Call the parent class's forward method with all the prepared inputs
+        if self.use_context_embedding and context_index is not None:
+            # Debug the actual values
+            idx = context_index.flatten()[0].item()
+        
+            # Get the embedding
+            context_emb_vector = self.context_embedding(context_index.long())
+        
+            # Print detailed info
+            print(f"[Debug] Context {idx}: embedding norm={context_emb_vector.norm().item():.4f}, "
+              f"mean={context_emb_vector.mean().item():.6f}, "
+              f"std={context_emb_vector.std().item():.6f}")
+        
+            # Check if embeddings are actually different
+            if idx == 0:
+                self._cached_emb_0 = context_emb_vector.clone()
+            elif hasattr(self, '_cached_emb_0'):
+                diff = (context_emb_vector - self._cached_emb_0).norm().item()
+                print(f"[Debug] Embedding difference from context 0: {diff:.6f}")
+        
+        # Handle context embedding if we have a context_index
+        if self.use_context_embedding and context_index is not None:
+            # Convert context_index to embedding
+            # context_index shape should be [B] or [B, 1]
+            if context_index.dim() == 1:
+                context_index = context_index.unsqueeze(1)  # [B] -> [B, 1]
+            
+            # Get embeddings from the embedding layer
+            # This returns shape [B, 1, D] where D is the embedding dimension
+            context_emb = self.context_embedding(context_index.long())
+            
+            # Handle different shapes
+            if context_emb.dim() == 2:
+                # If somehow we got [B, D], add sequence dimension
+                context_emb = context_emb.unsqueeze(1)  # [B, D] -> [B, 1, D]
+            elif context_emb.dim() == 3 and context_emb.shape[1] != 1:
+                # If we have [B, context_len, D] where context_len > 1, 
+                # we might need to handle this differently
+                pass  # Keep as is
+            
+            # Clone to avoid in-place modifications
+            crossattn_emb = context_emb.clone()
+            
+            # The official implementation uses repeat_interleave to expand if needed
+            # For diffusion renderer, we typically have sequence length of 1
+            expected_seq_len = 1
+            if crossattn_emb.shape[1] < expected_seq_len:
+                crossattn_emb = crossattn_emb.repeat_interleave(expected_seq_len, dim=1)
+            
+            # Ensure correct dtype and device
+            crossattn_emb = crossattn_emb.to(device=x.device, dtype=x.dtype)
+            
+            # Debug logging
+            print(f"[Debug] Context index: {context_index.flatten()[0].item() if context_index is not None else None}")
+            print(f"[Debug] Context embedding shape after processing: {crossattn_emb.shape}")
+            
+        elif crossattn_emb is None:
+            # If no context embedding and no crossattn_emb provided, create dummy
+            B = x.shape[0]
+            
+            # Get the expected dimension from the cross-attention layer
+            # Look for the first cross-attention block to get the context dimension
+            crossattn_emb_channels = 1024  # Default
+            for block_name, block in self.blocks.items():
+                for layer in block.blocks:
+                    if hasattr(layer, 'block_type') and layer.block_type in ['ca', 'cross_attn']:
+                        if hasattr(layer.block, 'attn'):
+                            # Get input dimension of key projection
+                            crossattn_emb_channels = layer.block.attn.to_k[0].in_features
+                            break
+                break
+            
+            # Create zero embedding as fallback
+            crossattn_emb = torch.zeros(
+                B, 1, crossattn_emb_channels, 
+                device=x.device, dtype=x.dtype
+            )
+            print(f"[Debug] Warning: Created zero crossattn_emb with shape {crossattn_emb.shape}")
+        
+        # Now call the parent class's forward method with all arguments
+        # The parent expects: x, timesteps, crossattn_emb, latent_condition, **kwargs
         return super().forward(
             x=x,
             timesteps=timesteps,
-            crossattn_emb=crossattn_emb,
-            latent_condition=latent_condition,
+            crossattn_emb=crossattn_emb,  # This MUST be passed as 3rd argument
+            latent_condition=latent_condition,  # This MUST be passed with correct name
+            crossattn_mask=crossattn_mask,
+            fps=fps,
+            image_size=image_size,
+            padding_mask=padding_mask,
+            scalar_feature=scalar_feature,
+            data_type=data_type,
+            latent_condition_sigma=latent_condition_sigma,
+            condition_video_augment_sigma=condition_video_augment_sigma,
             **kwargs
         )

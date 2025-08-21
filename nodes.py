@@ -100,6 +100,16 @@ class LoadDiffusionRendererModel:
         if "model" in state_dict:
             state_dict = state_dict["model"]
 
+        print("\n🔍 Context Embedding Debug:")
+    
+        # Look for context embedding in checkpoint
+        context_emb_key = None
+        for key in state_dict.keys():
+            if 'context_embedding' in key:
+                context_emb_key = key
+                print(f"  Found in checkpoint: {key} shape={state_dict[key].shape}")
+                break
+
         print("Instantiating model skeleton on 'meta' device...")
         basic_config = get_inverse_renderer_config()
         with torch.device("meta"):
@@ -114,18 +124,14 @@ class LoadDiffusionRendererModel:
         for key in sample_keys:
             print(f"  {key}: shape={state_dict[key].shape}")
 
+        if hasattr(model_instance, 'net') and hasattr(model_instance.net, 'context_embedding'):
+            ctx_emb = model_instance.net.context_embedding.weight
+            print(f"  Loaded context embedding: mean={ctx_emb.mean():.6f}, std={ctx_emb.std():.6f}")
+            print(f"  Shape: {ctx_emb.shape}")
+
         # Check for net. prefix
         has_net_prefix = any(k.startswith('net.') for k in state_dict.keys())
         print(f"\nCheckpoint has 'net.' prefix: {has_net_prefix}")
-
-        # If checkpoint has 'net.' prefix, remove it
-        if has_net_prefix:
-            new_state_dict = {}
-            for key, value in state_dict.items():
-                new_key = key.replace('net.', '', 1) if key.startswith('net.') else key
-                new_state_dict[new_key] = value
-            state_dict = new_state_dict
-            print("✅ Removed 'net.' prefix from checkpoint keys")
 
         def check_if_weights_loaded(model):
             """Check if model has non-zero weights (not just initialized)"""
@@ -154,6 +160,23 @@ class LoadDiffusionRendererModel:
                     print(f"  Context embedding: mean={ctx_emb.mean():.6f}, std={ctx_emb.std():.6f}")
 
         check_if_weights_loaded(model_instance)
+
+        ca_block = model_instance.net.blocks['block0'].blocks[1]  # First CA block
+        if hasattr(ca_block.block, 'attn'):
+            k_weight = ca_block.block.attn.to_k[0].weight
+            v_weight = ca_block.block.attn.to_v[0].weight
+    
+            print(f"\n🔍 Cross-Attention K/V Projection Analysis:")
+            print(f"  K weight shape: {k_weight.shape}")  # Should be [4096, 1024]
+            print(f"  K weight stats: mean={k_weight.mean():.6f}, std={k_weight.std():.6f}")
+            print(f"  K weight norm: {k_weight.norm():.4f}")
+    
+            # Check if weights are near zero
+            near_zero_k = (k_weight.abs() < 1e-6).sum().item()
+            print(f"  K near-zero weights: {near_zero_k}/{k_weight.numel()} ({100*near_zero_k/k_weight.numel():.2f}%)")
+    
+            print(f"  V weight stats: mean={v_weight.mean():.6f}, std={v_weight.std():.6f}")
+            print(f"  V weight norm: {v_weight.norm():.4f}")
         
         del state_dict
         mm.soft_empty_cache()
@@ -241,7 +264,7 @@ class Cosmos1InverseRenderer:
             data_batch = {
                 "rgb": image_tensor,
                 "video": image_tensor,
-                "context_index": torch.full((image_tensor.shape[0], 1), context_index, dtype=torch.long),
+                "context_index": torch.full((image_tensor.shape[0], 1), context_index, dtype=torch.long, device=image_tensor.device),
             }
             print(f"[Nodes] Running {gbuffer_pass} pass with context_index={context_index}")
 
@@ -377,6 +400,130 @@ class LoadHDRImage:
             img = np.repeat(img, 3, axis=2)
         tensor = torch.from_numpy(img).float().unsqueeze(0)
         return (tensor,)
+    
+class VAEPassthroughTest:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "vae_path": ("STRING", {"default": "Cosmos-1.0-Tokenizer-CV8x8x8/vae"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("output", "diff_image", "stats")
+    FUNCTION = "test_vae"
+    CATEGORY = "Cosmos1/Debug"
+
+    def test_vae(self, image, vae_path):
+        import torch
+        import numpy as np
+        import os
+        import folder_paths
+        from .CleanVAE import CleanVAE
+        
+        # Initialize VAE
+        vae_full_path = os.path.join(folder_paths.models_dir, "vae", vae_path)
+        vae = CleanVAE(model_path=vae_full_path)
+        vae.to(torch.device('cuda'))
+        
+        # Prepare input - convert to 5D tensor in [-1, 1]
+        if isinstance(image, list):
+            image = torch.stack(image, dim=0)
+        
+        # Handle dimensions
+        if image.ndim == 3:  # (H, W, C)
+            image = image.unsqueeze(0).unsqueeze(0)  # -> (1, 1, H, W, C)
+        elif image.ndim == 4:  # (B, H, W, C)
+            image = image.unsqueeze(1)  # -> (B, 1, H, W, C)
+        elif image.ndim == 5:  # Already (B, T, H, W, C)
+            pass
+        else:
+            raise ValueError(f"Unexpected image dimensions: {image.ndim}")
+        
+        B, T, H, W, C = image.shape
+        
+        # Convert to model format: (B, C, T, H, W) in range [-1, 1]
+        image_tensor = image.permute(0, 4, 1, 2, 3)
+        image_tensor = image_tensor * 2.0 - 1.0
+        
+        # Move to GPU
+        image_tensor = image_tensor.to(device='cuda', dtype=torch.bfloat16)
+        
+        print(f"\n{'='*60}")
+        print(f"VAE PASSTHROUGH TEST")
+        print(f"{'='*60}")
+        print(f"Input shape: {image_tensor.shape}")
+        print(f"Input range: [{image_tensor.min():.3f}, {image_tensor.max():.3f}]")
+        print(f"Input mean: {image_tensor.mean():.3f}, std: {image_tensor.std():.3f}")
+        
+        # Encode
+        with torch.no_grad():
+            latent = vae.encode(image_tensor)
+            print(f"\nLatent shape: {latent.shape}")
+            print(f"Latent range: [{latent.min():.3f}, {latent.max():.3f}]")
+            print(f"Latent mean: {latent.mean():.3f}, std: {latent.std():.3f}")
+            
+            # Decode
+            reconstructed = vae.decode(latent)
+            print(f"\nReconstructed shape: {reconstructed.shape}")
+            print(f"Reconstructed range: [{reconstructed.min():.3f}, {reconstructed.max():.3f}]")
+            print(f"Reconstructed mean: {reconstructed.mean():.3f}, std: {reconstructed.std():.3f}")
+        
+        # Calculate difference
+        diff = (reconstructed - image_tensor).abs()
+        print(f"\nReconstruction error (L1): {diff.mean():.4f}")
+        print(f"Max error: {diff.max():.4f}")
+        
+        # Try different output normalizations
+        print(f"\n{'='*40}")
+        print("Testing different output normalizations:")
+        print(f"{'='*40}")
+        
+        # Method 1: Standard [-1,1] to [0,1]
+        output1 = (reconstructed + 1.0) / 2.0
+        print(f"Method 1 (standard): [{output1.min():.3f}, {output1.max():.3f}]")
+        
+        # Method 2: Shift by mean (if biased)
+        output_mean = reconstructed.mean()
+        output2 = (reconstructed - output_mean + 1.0) / 2.0
+        print(f"Method 2 (shift by mean={output_mean:.3f}): [{output2.min():.3f}, {output2.max():.3f}]")
+        
+        # Method 3: Min-max normalization
+        output3 = (reconstructed - reconstructed.min()) / (reconstructed.max() - reconstructed.min())
+        print(f"Method 3 (min-max): [{output3.min():.3f}, {output3.max():.3f}]")
+        
+        # Method 4: Assume [-2, 0] range (based on your logs)
+        output4 = (reconstructed + 2.0) / 2.0
+        print(f"Method 4 (assume [-2,0]): [{output4.min():.3f}, {output4.max():.3f}]")
+        
+        # Use method 1 for output (you can change this based on results)
+        output_tensor = output1.clamp(0, 1)
+        
+        # Convert back to ComfyUI format (B, T, H, W, C)
+        output_tensor = output_tensor.permute(0, 2, 3, 4, 1)
+        output_tensor = output_tensor.reshape(B * T, H, W, C)
+        
+        # Create difference visualization
+        diff_normalized = diff / diff.max()  # Normalize diff to [0, 1]
+        diff_tensor = diff_normalized.permute(0, 2, 3, 4, 1)
+        diff_tensor = diff_tensor.reshape(B * T, H, W, C)
+        
+        # Create stats string
+        stats = f"""VAE Test Results:
+Input: [{image_tensor.min():.3f}, {image_tensor.max():.3f}]
+Latent: [{latent.min():.3f}, {latent.max():.3f}]
+Output: [{reconstructed.min():.3f}, {reconstructed.max():.3f}]
+Mean Error: {diff.mean():.4f}
+Output Mean: {reconstructed.mean():.3f} (should be ~0)
+Output Std: {reconstructed.std():.3f} (should be ~0.5-1.0)
+"""
+        
+        print(f"\n{stats}")
+        print(f"{'='*60}\n")
+        
+        return (output_tensor.cpu(), diff_tensor.cpu(), stats)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -384,6 +531,7 @@ NODE_CLASS_MAPPINGS = {
     "Cosmos1InverseRenderer": Cosmos1InverseRenderer,
     "Cosmos1ForwardRenderer": Cosmos1ForwardRenderer,
     "LoadHDRImage": LoadHDRImage,
+    "VAEPassthroughTest" : VAEPassthroughTest
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -391,4 +539,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Cosmos1InverseRenderer": "Cosmos1 Inverse Renderer",
     "Cosmos1ForwardRenderer": "Cosmos1 Forward Renderer",
     "LoadHDRImage": "Load HDR Image",
+    "VAEPassthroughTest": "VAE Passthrough Test"
 }

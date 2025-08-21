@@ -36,7 +36,7 @@ class CleanDiffusionRendererConfig:
         # Default condition parameters
         self.condition_keys = ["rgb"]
         self.condition_drop_rate = 0.0
-        self.append_condition_mask = True
+        self.append_condition_mask = False
         
         # Model architecture defaults
         self.model_channels = 4096
