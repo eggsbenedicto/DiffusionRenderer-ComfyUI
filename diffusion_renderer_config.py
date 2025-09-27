@@ -224,13 +224,13 @@ def get_forward_renderer_config(
             "env_ldr", "env_log", "env_nrm"
         ],
         "condition_drop_rate": 0.05,
-        "append_condition_mask": True,
+        "append_condition_mask": False,
         
         # Network architecture
         "net": {
             **network_config,
-            "additional_concat_ch": 17 * 8,  # 136 channels for all condition maps
-            "use_context_embedding": False,
+            "additional_concat_ch": 16,  
+            "use_context_embedding": True,
             "crossattn_emb_channels": 1024,  # FIXED: Must match checkpoint expectation!
         },
         

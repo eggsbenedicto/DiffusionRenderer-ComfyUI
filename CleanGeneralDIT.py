@@ -974,6 +974,10 @@ class CleanDiffusionRendererGeneralDIT(CleanGeneralDIT):
         Returns:
             Output tensor from the diffusion model
         """
+        if latent_condition is not None:
+            print(f"[DIT] Received latent_condition: shape={latent_condition.shape}, will concatenate")
+        else:
+            print("[DIT] WARNING: No latent_condition received - running without RGB conditioning!")
 
         if self.use_context_embedding and context_index is not None:
             # Debug the actual values

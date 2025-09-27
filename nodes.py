@@ -189,7 +189,7 @@ class LoadDiffusionRendererModel:
             model_type=None,
             vae_instance=vae_instance,
             model_instance=model_instance,
-            guidance=0.0,
+            guidance=2.0,
             num_steps=15,
             seed=42,
             dtype=dtype,
