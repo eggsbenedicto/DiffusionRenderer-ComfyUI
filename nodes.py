@@ -428,6 +428,9 @@ class VAEPassthroughTest:
         vae = CleanVAE(model_path=vae_full_path)
         vae.to(torch.device('cuda'))
         
+        # Use float32 for best quality in testing
+        vae.reset_dtype(torch.float32)
+        
         # Prepare input - convert to 5D tensor in [-1, 1]
         if isinstance(image, list):
             image = torch.stack(image, dim=0)
@@ -448,11 +451,11 @@ class VAEPassthroughTest:
         image_tensor = image.permute(0, 4, 1, 2, 3)
         image_tensor = image_tensor * 2.0 - 1.0
         
-        # Move to GPU
-        image_tensor = image_tensor.to(device='cuda', dtype=torch.bfloat16)
+        # Move to GPU with float32 for best precision
+        image_tensor = image_tensor.to(device='cuda', dtype=torch.float32)
         
         print(f"\n{'='*60}")
-        print(f"VAE PASSTHROUGH TEST")
+        print(f"VAE PASSTHROUGH TEST (float32 precision)")
         print(f"{'='*60}")
         print(f"Input shape: {image_tensor.shape}")
         print(f"Input range: [{image_tensor.min():.3f}, {image_tensor.max():.3f}]")
@@ -473,8 +476,14 @@ class VAEPassthroughTest:
         
         # Calculate difference
         diff = (reconstructed - image_tensor).abs()
-        print(f"\nReconstruction error (L1): {diff.mean():.4f}")
-        print(f"Max error: {diff.max():.4f}")
+        mse = ((reconstructed - image_tensor) ** 2).mean()
+        psnr = 20 * torch.log10(2.0 / torch.sqrt(mse))  # PSNR for [-1,1] range
+        
+        print(f"\nReconstruction Metrics:")
+        print(f"  L1 Error: {diff.mean():.6f}")
+        print(f"  MSE: {mse:.6f}")
+        print(f"  PSNR: {psnr:.2f} dB")
+        print(f"  Max Error: {diff.max():.6f}")
         
         # Try different output normalizations
         print(f"\n{'='*40}")
@@ -485,39 +494,45 @@ class VAEPassthroughTest:
         output1 = (reconstructed + 1.0) / 2.0
         print(f"Method 1 (standard): [{output1.min():.3f}, {output1.max():.3f}]")
         
-        # Method 2: Shift by mean (if biased)
-        output_mean = reconstructed.mean()
-        output2 = (reconstructed - output_mean + 1.0) / 2.0
-        print(f"Method 2 (shift by mean={output_mean:.3f}): [{output2.min():.3f}, {output2.max():.3f}]")
+        # Method 2: Clamp first then normalize (for outputs slightly outside [-1,1])
+        output2 = (reconstructed.clamp(-1, 1) + 1.0) / 2.0
+        print(f"Method 2 (clamp then normalize): [{output2.min():.3f}, {output2.max():.3f}]")
         
         # Method 3: Min-max normalization
-        output3 = (reconstructed - reconstructed.min()) / (reconstructed.max() - reconstructed.min())
-        print(f"Method 3 (min-max): [{output3.min():.3f}, {output3.max():.3f}]")
+        if reconstructed.max() > reconstructed.min():
+            output3 = (reconstructed - reconstructed.min()) / (reconstructed.max() - reconstructed.min())
+            print(f"Method 3 (min-max): [{output3.min():.3f}, {output3.max():.3f}]")
+        else:
+            output3 = output2  # Fallback if constant
         
-        # Method 4: Assume [-2, 0] range (based on your logs)
-        output4 = (reconstructed + 2.0) / 2.0
-        print(f"Method 4 (assume [-2,0]): [{output4.min():.3f}, {output4.max():.3f}]")
-        
-        # Use method 1 for output (you can change this based on results)
-        output_tensor = output1.clamp(0, 1)
+        # Use method 2 for output (clamp then normalize - safest)
+        output_tensor = output2.clamp(0, 1)
         
         # Convert back to ComfyUI format (B, T, H, W, C)
         output_tensor = output_tensor.permute(0, 2, 3, 4, 1)
         output_tensor = output_tensor.reshape(B * T, H, W, C)
         
-        # Create difference visualization
-        diff_normalized = diff / diff.max()  # Normalize diff to [0, 1]
-        diff_tensor = diff_normalized.permute(0, 2, 3, 4, 1)
+        # Create difference visualization (amplify for visibility)
+        diff_vis = diff * 5.0  # Amplify difference for visualization
+        diff_vis = diff_vis.clamp(0, 1)
+        diff_tensor = diff_vis.permute(0, 2, 3, 4, 1)
         diff_tensor = diff_tensor.reshape(B * T, H, W, C)
         
         # Create stats string
-        stats = f"""VAE Test Results:
+        stats = f"""VAE Test Results (float32):
 Input: [{image_tensor.min():.3f}, {image_tensor.max():.3f}]
 Latent: [{latent.min():.3f}, {latent.max():.3f}]
 Output: [{reconstructed.min():.3f}, {reconstructed.max():.3f}]
-Mean Error: {diff.mean():.4f}
-Output Mean: {reconstructed.mean():.3f} (should be ~0)
-Output Std: {reconstructed.std():.3f} (should be ~0.5-1.0)
+
+Quality Metrics:
+  L1 Error: {diff.mean():.6f}
+  MSE: {mse:.6f}
+  PSNR: {psnr:.2f} dB
+  Max Error: {diff.max():.6f}
+
+Statistics:
+  Output Mean: {reconstructed.mean():.3f} (ideal: ~0)
+  Output Std: {reconstructed.std():.3f} (ideal: ~0.5)
 """
         
         print(f"\n{stats}")

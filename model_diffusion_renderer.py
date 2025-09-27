@@ -147,17 +147,33 @@ class CleanDiffusionRendererModel(nn.Module):
             return {"device": torch.device("cuda"), "dtype": torch.bfloat16}
     
     def encode(self, x: Tensor) -> Tensor:
-        """Encode input to latent space and scale by sigma_data"""
-        encoded = self.vae.encode(x)
-        #scaled = encoded * self.sigma_data
-        print(f"[VAE] Encode: input range=[{x.min():.2f}, {x.max():.2f}], output range=[{encoded.min():.2f}, {encoded.max():.2f}]")
-        return encoded
+        """Encode input to latent space using float32 for accuracy"""
+        # Store original dtype
+        orig_dtype = x.dtype
+        
+        # Convert to float32 for VAE
+        x_fp32 = x.to(dtype=torch.float32)
+        
+        # Encode in float32
+        with torch.cuda.amp.autocast(enabled=False):  # Disable autocast
+            encoded = self.vae.encode(x_fp32)
+        
+        # Convert back to original dtype for diffusion model
+        return encoded.to(dtype=orig_dtype)
 
     def decode(self, x: Tensor) -> Tensor:
-        """Decode from latent space, unscaling by sigma_data"""
-        #scaled = x / self.sigma_data  
-        decoded = self.vae.decode(x)
-        print(f"[VAE] Decode: input range=[{x.min():.2f}, {x.max():.2f}], output range=[{decoded.min():.2f}, {decoded.max():.2f}]")
+        """Decode from latent space using float32 for accuracy"""
+        # Store original dtype
+        orig_dtype = x.dtype
+        
+        # Convert to float32 for VAE
+        x_fp32 = x.to(dtype=torch.float32)
+        
+        # Decode in float32
+        with torch.cuda.amp.autocast(enabled=False):  # Disable autocast
+            decoded = self.vae.decode(x_fp32)
+        
+        # Keep output in float32 for quality (convert later if needed)
         return decoded
         
     def prepare_diffusion_renderer_latent_conditions(
